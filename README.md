@@ -94,7 +94,7 @@ abiogenesis islands ...   # several worlds with migration
 Oceans aren't in the repo. enwik8 (100 MB of Wikipedia, the Hutter Prize file) is at
 http://mattmahoney.net/dc/enwik8.zip; unzip it into `oceans/`.
 
-`scripts/queue.ps1` runs a 10-seed batch of one or more experiment arms, a fixed number at
+`scripts/queue.sh` (Linux) and `scripts/queue.ps1` (Windows) run a 10-seed batch of one or more experiment arms, a fixed number at
 a time, at below-normal priority.
 
 Outputs per run: `report.html`, `census.csv`, `events.log`, `genebank/*.tasm`, `config.txt`,
