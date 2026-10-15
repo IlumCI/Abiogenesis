@@ -1,0 +1,1811 @@
+﻿//! The soup: one circular strip of memory where creatures live, copy themselves,
+//! and get reaped. No fitness function anywhere. Survival is the only judge.
+
+use crate::isa::*;
+use crate::prof;
+use crate::rng::Rng;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::{Rc, Weak};
+
+const STACK: usize = 10;
+const MAX_TEMPLATE: u32 = 6;
+/// One error ages a creature by this many births in the reaper's eyes.
+const ERROR_WEIGHT: i64 = 4;
+/// How far `mal` scans for free space per look.
+const SEARCH_WINDOW: u32 = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Regime {
+    #[default]
+    Commons,
+    Feudal,
+    Capitalist,
+    /// Starts as a commons. Property, rent and revolt are instructions creatures may evolve.
+    Evolved,
+}
+
+/// Fee to enclose a region, paid to the commons. Affordable only with a surplus.
+const ENCLOSE_FEE: u64 = 50_000;
+/// Highest rent a title holder may levy, percent.
+const MAX_LEVY: u64 = 50;
+
+/// Share of a producer's income its feudal lord takes.
+const FEUDAL_RENT_PCT: u64 = 30;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Params {
+    pub soup_bits: u32,
+    /// One copy in this many is miscopied.
+    pub copy_error: u64,
+    /// Mean instructions between cosmic rays, before the weather scales it.
+    pub cosmic_base: u64,
+    /// The reaper keeps the soup at most this full.
+    pub fill: f64,
+    pub min_size: u32,
+    pub max_size: u32,
+    pub search_limit: u32,
+    /// Slice multiplier for creatures whose body lies in sunlight.
+    pub sun_bonus: u64,
+    /// Pay creatures in CPU time for computing logic on feed data.
+    pub tasks: bool,
+    /// One birth in this many gets a cell inserted, and one in this many a cell deleted. 0 = never.
+    pub indel: u64,
+    pub max_merit: u32,
+    /// A creature dies of old age after executing this many times its own length (Avida uses 20;
+    /// at 25 here, lineages that evolved longer computations went sterile).
+    pub max_age: u64,
+    /// The ocean pays one extra unit of merit per this many correct guesses. 0 = no ocean.
+    pub ocean_div: u32,
+    pub ocean_cap: u32,
+    /// Give creatures a private 256-byte memory (load/store), inherited by their children.
+    pub memory: bool,
+    /// Allow `infect`: take CPU from a nearby creature that shares a logic task (the Red
+    /// Queen; Zaman et al. 2014). Neighbours only, within this many cells.
+    pub infect: bool,
+    pub infect_radius: u32,
+    /// The reef: each region of the soup has a stream creatures can `emit` into and, after
+    /// `tune`, `dive` from. Decoding a rival pays the reader and costs the emitter; a
+    /// relative predicting you pays you. Mixed cooperation and competition (Moran & Pollack).
+    pub reef: bool,
+    /// Conserved energy economy instead of relative merit: a fixed total supply, each
+    /// instruction costs one unit back to a commons pool, and income is the pool's payout
+    /// split by score. Nothing is ever minted, so every unit is accounted for.
+    pub energy: bool,
+    pub energy_total: u64,
+    /// Property in land (the 16 regions): none (a commons), feudal or capitalist.
+    pub regime: Regime,
+    /// Mutation draws only from the ops of features that are switched on, and the rest are
+    /// errors. With all 51 ops in play, any one op was too rare for evolution to find.
+    /// Also: a child must be copied in full, from the mother's own body.
+    pub lean: bool,
+    /// Allow `give`, `mate`, `learn`, `teach` and `join` (only matters when lean).
+    pub social: bool,
+    /// The ocean is the living population's own genomes, resampled every epoch.
+    pub genome_ocean: bool,
+    /// Percent of mutations drawn from an order-2 model of genomes that persisted, instead
+    /// of uniformly. 0 = off.
+    pub learned_mut: u32,
+}
+
+/// Bytes of genome in the genome ocean each epoch: about half a typical population.
+const GENOME_OCEAN: usize = 1 << 16;
+
+/// The ops mutation can produce and creatures can run: the Tierra core, plus each switched-on
+/// feature's own ops. Without `lean`, all of them.
+pub fn alphabet(p: &Params, has_ocean: bool) -> Vec<u8> {
+    if !p.lean {
+        return (0..NUM_OPS).collect();
+    }
+    let mut ops: Vec<u8> = (0..=SENSE).chain([NOPX]).collect();
+    let on = |f: bool, xs: &[u8], ops: &mut Vec<u8>| if f { ops.extend_from_slice(xs) };
+    on(p.tasks, &[NAND, IO], &mut ops);
+    on(has_ocean || p.genome_ocean || p.reef, &[DIVE, GUESS], &mut ops);
+    on(p.memory, &[LOAD, STORE], &mut ops);
+    on(p.infect, &[INFECT], &mut ops);
+    on(p.reef, &[EMIT, TUNE], &mut ops);
+    on(p.regime == Regime::Evolved, &[ENCLOSE, LEVY, REVOLT], &mut ops);
+    on(p.social, &[MATE, LEARN, TEACH, JOIN], &mut ops);
+    on(p.social && p.energy, &[GIVE], &mut ops);
+    ops
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            soup_bits: 18,
+            copy_error: 1000,
+            cosmic_base: 60_000,
+            fill: 0.8,
+            min_size: 12,
+            max_size: 512,
+            search_limit: 1024,
+            sun_bonus: 2,
+            tasks: true,
+            indel: 20,
+            max_merit: 1024,
+            max_age: 100,
+            ocean_div: 1,
+            ocean_cap: 32,
+            memory: true,
+            infect: true,
+            infect_radius: 2048,
+            reef: true,
+            energy: false,
+            energy_total: 64_000_000,
+            regime: Regime::Commons,
+            lean: true,
+            social: false,
+            genome_ocean: false,
+            learned_mut: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Weather {
+    pub sun_center: u32,
+    pub sun_half: u32,
+    pub cosmic_interval: u64,
+    /// Bit t set: task t pays right now.
+    pub rewarded: u16,
+    /// Which of the two goal sets is live (modularly varying goals, Kashtan & Alon 2005).
+    pub goal: u8,
+    /// Seeds the numbers creatures read with `io`.
+    pub data: u64,
+}
+
+/// echo, not, nand and equ always pay; the middle tasks swap between two goal sets.
+const GOALS: [u16; 2] = [0b11_1001_0111, 0b11_0110_1011];
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Creature {
+    pub id: u64,
+    pub alive: bool,
+    pub start: u32,
+    pub size: u32,
+    pub child: Option<(u32, u32)>,
+    pub child_writes: u32,
+    /// Which cells of the child have been written (lean only counts each cell once).
+    pub child_seen: [u64; 8],
+    pub ax: u32,
+    pub bx: u32,
+    pub cx: u32,
+    pub dx: u32,
+    pub ip: u32,
+    pub sp: u8,
+    pub stack: [u32; STACK],
+    pub birth: u64,
+    pub errors: u32,
+    pub genotype: u64,
+    /// Set when this creature executes code outside its own body this cycle.
+    pub ran_foreign: bool,
+    /// Set when this creature used `sense` this cycle.
+    pub sensed: bool,
+    /// Speed multiplier earned by the tasks of the parent's last cycle.
+    pub merit: u32,
+    /// Tasks done since the last divide, and in the last full cycle.
+    pub tasks_now: u16,
+    pub tasks_last: u16,
+    /// Already infected someone since the last birth.
+    infected: bool,
+    inputs: [u32; 3],
+    reads: u32,
+    /// Where this lineage is in the ocean, its pending guess, and how it did.
+    pub pos: u32,
+    guess: u8,
+    has_guess: bool,
+    pub hits: u32,
+    pub scored: u32,
+    pub hits_last: u32,
+    pub scored_last: u32,
+    /// Sum over guesses of (bits matched - 4): 0 for random guessing, +4 for an exact byte.
+    pub bits: i32,
+    pub bits_last: i32,
+    /// Instructions executed in this life.
+    age: u64,
+    /// Shared per-genotype table of where each jump in the genome lands, and whether this
+    /// body has changed since birth (then the table no longer describes it).
+    #[serde(skip)]
+    cache: Option<JumpTable>,
+    dirty: bool,
+    /// Private memory, 256 bytes once in use. Children start with a copy of their
+    /// mother's, so what one generation learns the next begins with.
+    pub mem: Vec<u8>,
+    /// The last byte this lineage read from the ocean.
+    prev: u8,
+    /// Diving the local reef instead of the ocean, where in it, and what emitting has earned.
+    reef_mode: bool,
+    reef_pos: u64,
+    pub emit_bits: i32,
+    /// Energy balance, and the score earned this epoch that sets its share of the payout.
+    pub energy: u64,
+    score: u64,
+    idle: u32,
+    /// The mother's id, for inheritance.
+    pub parent: u64,
+    /// Chosen partner for the next birth (slot, id), and alliance (0 = none). Alliances are
+    /// not inherited: inherited ones grew into one pool of everybody, which pays nobody
+    /// for doing better and stops selection cold. Each life has to join for itself.
+    mate: Option<(u32, u64)>,
+    pub group: u64,
+    reap_score: i64,
+}
+
+impl Creature {
+    fn owns(&self, a: u32) -> bool {
+        (a >= self.start && a < self.start + self.size)
+            || matches!(self.child, Some((s, z)) if a >= s && a < s + z)
+    }
+}
+
+/// Bytes each region's reef remembers.
+const REEF_CAP: usize = 4096;
+const REGIONS: u32 = 16;
+
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+struct Emitter {
+    slot: u32,
+    id: u64,
+    genotype: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Reef {
+    data: Vec<u8>,
+    from: Vec<Emitter>,
+    written: u64,
+}
+
+/// Offset of each jump's landing spot within the genome, UNKNOWN until first worked out.
+type JumpTable = Rc<RefCell<Vec<u32>>>;
+const UNKNOWN: u32 = u32::MAX;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum Event {
+    Birth {
+        mother: u64,
+        /// The mother's body as it is now. Cosmic rays can change it after birth.
+        mother_now: u64,
+        child: u64,
+        child_size: u32,
+        foreign: bool,
+        sensed: bool,
+        tasks: u16,
+    },
+    Death {
+        genotype: u64,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct World {
+    pub p: Params,
+    /// What mutation draws from, and the same set as a bitmask for execution.
+    ops: Vec<u8>,
+    enabled: u64,
+    pub n: u32,
+    mask: u32,
+    pub soup: Vec<u8>,
+    /// slot + 1 of whoever holds each cell, 0 if free.
+    owner: Vec<u32>,
+    occ: Vec<u64>,
+    #[serde(skip)]
+    jump_tables: HashMap<u64, Weak<RefCell<Vec<u32>>>>,
+    reefs: Vec<Reef>,
+    region: u32,
+    pub cs: Vec<Creature>,
+    free_slots: Vec<usize>,
+    reaper: BTreeSet<(i64, u64, usize)>,
+    pub alive: usize,
+    used: u64,
+    pub rng: Rng,
+    pub weather: Weather,
+    pub instr: u64,
+    next_cosmic: u64,
+    birth_seq: u64,
+    next_id: u64,
+    rr: usize,
+    pub events: Vec<Event>,
+    pub stats: Stats,
+    indel_hit: bool,
+    /// Read-only real-world data the creatures can dive into. Empty means no ocean.
+    #[serde(skip)]
+    pub ocean: Vec<u8>,
+    /// The commons: energy not held by any creature.
+    pub pool: u64,
+    /// Per region: who holds the title (lord or deed holder) and the lease price per cell.
+    titles: Vec<Option<(usize, u64)>>,
+    prices: Vec<u64>,
+    /// Rent rate each region's holder has levied, percent (evolved regime).
+    levies: Vec<u64>,
+    /// Population mean merit x1000, refreshed each epoch. Merit buys a share of CPU, not an
+    /// absolute amount (as in Avida): absolute slices let one lineage stretch a round to
+    /// dozens of epochs, outlive its own age limit every turn, and stall the world.
+    merit_mean_k: u64,
+    /// Learned mutation: counts of op c after ops a, b in persistent genomes, at
+    /// [(a * 64 + b) * 64 + c]. Empty when off.
+    model: Vec<u32>,
+    pub model_total: u64,
+}
+
+/// Where scratch (nopx) cells go, per epoch. Reset by the census.
+#[derive(Clone, Copy, Default, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Stats {
+    pub births: u64,
+    /// nopx carried by mothers at the moment they gave birth, summed.
+    pub mother_nopx: u64,
+    /// nopx lost or gained between mother and child, by cause.
+    pub lost_resize: u64,
+    pub lost_indel: u64,
+    pub lost_point: u64,
+    pub gained: u64,
+    pub resized: u64,
+    pub infections: u64,
+    pub emits: u64,
+    pub reef_reads: u64,
+    pub kin_reads: u64,
+    /// Energy paid as rent (feudal dues or market leases), and tenants evicted.
+    pub rent: u64,
+    pub evictions: u64,
+    pub enclosures: u64,
+    pub revolts_won: u64,
+    pub revolts_lost: u64,
+    pub gifts: u64,
+    pub gifted: u64,
+    pub matings: u64,
+    pub lessons: u64,
+    pub joins: u64,
+    /// Deaths by cause. Evictions are counted separately above.
+    pub died_old: u64,
+    pub died_starved: u64,
+    pub died_reaped: u64,
+}
+
+pub fn genotype_of(code: &[u8]) -> u64 {
+    u64::from_le_bytes(blake3::hash(code).as_bytes()[..8].try_into().unwrap())
+}
+
+impl World {
+    pub fn new(p: Params, seed: u64, ocean: Vec<u8>) -> Self {
+        let n = 1u32 << p.soup_bits;
+        let mut rng = Rng::new(seed);
+        // The soup starts as noise, not zeros, so there's leftover junk to stumble into.
+        let ops = alphabet(&p, !ocean.is_empty());
+        let enabled = ops.iter().fold(0u64, |m, &o| m | 1 << o);
+        let soup = (0..n).map(|_| ops[rng.below(ops.len() as u64) as usize]).collect();
+        let weather = Weather { sun_center: 0, sun_half: n / 16, cosmic_interval: p.cosmic_base, rewarded: GOALS[0], goal: 0, data: 0 };
+        World {
+            ops,
+            enabled,
+            n,
+            mask: n - 1,
+            soup,
+            owner: vec![0; n as usize],
+            occ: vec![0; (n as usize).div_ceil(64)],
+            jump_tables: HashMap::new(),
+            reefs: (0..REGIONS).map(|_| Reef { data: vec![0; REEF_CAP], from: vec![Emitter::default(); REEF_CAP], written: 0 }).collect(),
+            region: n / REGIONS,
+            cs: Vec::new(),
+            free_slots: Vec::new(),
+            reaper: BTreeSet::new(),
+            alive: 0,
+            used: 0,
+            next_cosmic: p.cosmic_base,
+            rng,
+            weather,
+            instr: 0,
+            birth_seq: 0,
+            next_id: 0,
+            rr: 0,
+            events: Vec::new(),
+            stats: Stats::default(),
+            indel_hit: false,
+            pool: if p.energy { p.energy_total } else { 0 },
+            titles: vec![None; REGIONS as usize],
+            prices: vec![1; REGIONS as usize],
+            levies: vec![0; REGIONS as usize],
+            ocean,
+            merit_mean_k: 1000,
+            model: if p.learned_mut > 0 { vec![0; 1 << 18] } else { Vec::new() },
+            model_total: 0,
+            p,
+        }
+    }
+
+    /// Weather comes from the feed: where the sun is, how wide, how hard the cosmic rays hit.
+    pub fn set_weather(&mut self, b: &[u8; 32]) {
+        let n = self.n;
+        self.weather.sun_center = u32::from_le_bytes(b[0..4].try_into().unwrap()) & self.mask;
+        self.weather.sun_half = n / 32 + (b[4] as u32 * (n / 16)) / 255;
+        let shift = (b[5] % 5) as i32 - 2;
+        self.weather.cosmic_interval = if shift >= 0 {
+            self.p.cosmic_base << shift
+        } else {
+            self.p.cosmic_base >> -shift
+        };
+        // Goals switch rarely, about one epoch in sixteen, so lineages have time to adapt.
+        if b[6] < 16 {
+            self.weather.goal ^= 1;
+        }
+        self.weather.rewarded = GOALS[self.weather.goal as usize];
+        self.weather.data = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        self.rng.mix(b);
+        if self.p.energy {
+            self.payout();
+        }
+        self.jump_tables.retain(|_, t| t.strong_count() > 0);
+        let alive: Vec<_> = self.cs.iter().filter(|c| c.alive).collect();
+        if !alive.is_empty() {
+            // The yardstick for CPU share: mean merit, or in the energy economy mean wealth.
+            let total: u64 = if self.p.energy {
+                alive.iter().map(|c| c.energy).sum()
+            } else {
+                alive.iter().map(|c| c.merit.max(1) as u64).sum()
+            };
+            self.merit_mean_k = (total * 1000 / alive.len() as u64).max(1);
+        }
+    }
+
+    /// After loading a snapshot: reattach the ocean and rebuild the per-genotype jump
+    /// tables, which are a cache and never saved.
+    /// The genome ocean: what creatures dive into is a sample of the living population's
+    /// own code, rebuilt every epoch from a random slot onward. Predicting it means
+    /// modelling your neighbours, and it changes whenever they do.
+    pub fn refresh_genome_ocean(&mut self) {
+        self.ocean.clear();
+        let n = self.cs.len();
+        if n == 0 {
+            return;
+        }
+        let first = self.rng.below(n as u64) as usize;
+        for k in 0..n {
+            let c = &self.cs[(first + k) % n];
+            if c.alive {
+                self.ocean.extend_from_slice(&self.soup[c.start as usize..(c.start + c.size) as usize]);
+                if self.ocean.len() >= GENOME_OCEAN {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn after_load(&mut self, ocean: Vec<u8>) {
+        self.ocean = ocean;
+        for i in 0..self.cs.len() {
+            if !self.cs[i].alive {
+                continue;
+            }
+            let (g, size) = (self.cs[i].genotype, self.cs[i].size);
+            let table = match self.jump_tables.get(&g).and_then(Weak::upgrade) {
+                Some(t) if t.borrow().len() == size as usize => t,
+                _ => {
+                    let t = Rc::new(RefCell::new(vec![UNKNOWN; size as usize]));
+                    self.jump_tables.insert(g, Rc::downgrade(&t));
+                    t
+                }
+            };
+            self.cs[i].cache = Some(table);
+        }
+    }
+
+    /// Copies of `k` living genomes picked at random, to send to another island.
+    pub fn emigrants(&mut self, k: usize) -> Vec<Vec<u8>> {
+        let alive: Vec<usize> = (0..self.cs.len()).filter(|&i| self.cs[i].alive).collect();
+        if alive.is_empty() {
+            return Vec::new();
+        }
+        (0..k)
+            .map(|_| {
+                let c = &self.cs[alive[self.rng.below(alive.len() as u64) as usize]];
+                self.soup[c.start as usize..(c.start + c.size) as usize].to_vec()
+            })
+            .collect()
+    }
+
+    /// A migrant from another island lands somewhere free, as a newborn with no merit.
+    pub fn immigrate(&mut self, code: &[u8]) {
+        let size = code.len() as u32;
+        if size < self.p.min_size || size > self.p.max_size {
+            return;
+        }
+        let limit = (self.p.fill * self.n as f64) as u64;
+        while self.used + size as u64 > limit {
+            if !self.reap_one(usize::MAX) {
+                break;
+            }
+        }
+        let from = self.rng.below(self.n as u64) as u32;
+        if let Some(at) = self.find_free(from, size, self.n) {
+            self.soup[at as usize..(at + size) as usize].copy_from_slice(code);
+            let g = genotype_of(code);
+            let slot = self.spawn(at, size, g, 1, 0);
+            self.endow(slot, 10_000);
+            self.events.push(Event::Birth { mother: g, mother_now: g, child: g, child_size: size, foreign: false, sensed: false, tasks: 0 });
+        }
+    }
+
+    /// Half the commons is paid out each epoch. Half of that is what the land yields: split
+    /// by the cells each creature occupies, enough to subsist on. The other half is split by
+    /// the score each creature earned. Integer shares round down; the remainder stays put.
+    fn payout(&mut self) {
+        let budget = self.pool / 2;
+        let scores: u128 = self.cs.iter().filter(|c| c.alive).map(|c| c.score as u128).sum();
+        let land: u128 = self.cs.iter().filter(|c| c.alive).map(|c| c.size as u128).sum();
+        let by_score = if scores > 0 { budget / 2 } else { 0 };
+        let by_land = budget - by_score;
+        let mut credit = vec![0u64; self.cs.len()];
+        for i in 0..self.cs.len() {
+            if !self.cs[i].alive {
+                continue;
+            }
+            let c = &self.cs[i];
+            let mut share = 0u64;
+            if land > 0 {
+                share += (by_land as u128 * c.size as u128 / land) as u64;
+            }
+            if scores > 0 {
+                share += (by_score as u128 * c.score as u128 / scores) as u64;
+            }
+            self.pool -= share;
+            // Under feudalism a customary share of what each producer earns goes to the
+            // lord of the land it lives on, by right rather than by contract.
+            let r = (c.start / self.region) as usize;
+            let lord = match self.p.regime {
+                Regime::Feudal => self.lord_of(r),
+                Regime::Evolved => self.holder_of(r),
+                _ => None,
+            };
+            let pct = if self.p.regime == Regime::Evolved { self.levies[r] } else { FEUDAL_RENT_PCT };
+            match lord {
+                Some(l) if l != i => {
+                    let rent = share * pct / 100;
+                    self.cs[l].energy += rent;
+                    credit[i] += share - rent;
+                    self.stats.rent += rent;
+                }
+                _ => credit[i] += share,
+            }
+        }
+        // Alliances pool what their members earned and split it evenly; the remainder of
+        // the division goes to the first member, so nothing is lost.
+        let mut groups: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for i in 0..self.cs.len() {
+            if self.cs[i].alive && self.cs[i].group != 0 {
+                groups.entry(self.cs[i].group).or_default().push(i);
+            }
+        }
+        for members in groups.values().filter(|m| m.len() > 1) {
+            let total: u64 = members.iter().map(|&i| credit[i]).sum();
+            let each = total / members.len() as u64;
+            for &i in members {
+                credit[i] = each;
+            }
+            credit[members[0]] += total - each * members.len() as u64;
+        }
+        for (i, c) in credit.into_iter().enumerate() {
+            self.cs[i].energy += c;
+        }
+        for c in self.cs.iter_mut() {
+            c.score = 0;
+        }
+        if self.p.regime == Regime::Capitalist {
+            // Yield per cell this epoch, in thousandths of a unit.
+            let yield_k = if land > 0 { (by_land as u128 * 1000 / land) as u64 } else { 0 };
+            self.leases(yield_k);
+        }
+    }
+
+    /// Who holds a region in the evolved regime. A dead holder's title passes to its eldest
+    /// living child in the region; with no heir the land returns to the commons.
+    fn holder_of(&mut self, r: usize) -> Option<usize> {
+        let (slot, id) = self.titles[r]?;
+        if self.cs[slot].alive && self.cs[slot].id == id {
+            return Some(slot);
+        }
+        let heir = (0..self.cs.len())
+            .filter(|&i| self.cs[i].alive && self.cs[i].parent == id && (self.cs[i].start / self.region) as usize == r)
+            .min_by_key(|&i| self.cs[i].id);
+        self.titles[r] = heir.map(|i| (i, self.cs[i].id));
+        if heir.is_none() {
+            self.levies[r] = 0;
+        }
+        heir
+    }
+
+    /// Property and politics as instructions (evolved regime only). Returns false on failure.
+    fn politics(&mut self, c: &mut Creature, slot: usize, op: u8) -> bool {
+        let r = (c.start / self.region) as usize;
+        // The running creature is lifted out of `cs` while it runs, so its own title has to
+        // be recognised here; asking holder_of would see an empty seat and dissolve it.
+        let own = self.titles[r] == Some((slot, c.id));
+        let holder = if own { Some(slot) } else { self.holder_of(r) };
+        match op {
+            ENCLOSE => {
+                if holder.is_some() || c.energy < ENCLOSE_FEE {
+                    return false;
+                }
+                c.energy -= ENCLOSE_FEE;
+                self.pool += ENCLOSE_FEE;
+                self.titles[r] = Some((slot, c.id));
+                self.levies[r] = 0;
+                self.stats.enclosures += 1;
+            }
+            LEVY => {
+                if !own {
+                    return false;
+                }
+                self.levies[r] = (c.cx as u64 % 101).min(MAX_LEVY);
+            }
+            REVOLT => {
+                let Some(h) = holder else { return false };
+                if own {
+                    return false;
+                }
+                if c.energy > self.cs[h].energy {
+                    self.titles[r] = Some((slot, c.id));
+                    self.stats.revolts_won += 1;
+                } else {
+                    let cost = c.energy / 2;
+                    c.energy -= cost;
+                    self.cs[h].energy += cost;
+                    self.stats.revolts_lost += 1;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Sex, culture and alliance. The neighbour is whoever owns the cell ax points at.
+    fn social(&mut self, c: &mut Creature, slot: usize, op: u8) -> bool {
+        let o = self.owner[(c.ax & self.mask) as usize];
+        if o == 0 || o as usize - 1 == slot {
+            return false;
+        }
+        let n = o as usize - 1;
+        let d = c.start.wrapping_sub(self.cs[n].start) & self.mask;
+        if d.min(self.n - d) > self.p.infect_radius {
+            return false;
+        }
+        match op {
+            MATE => {
+                c.mate = Some((n as u32, self.cs[n].id));
+                self.stats.matings += 1;
+            }
+            LEARN | TEACH => {
+                // 16 bytes of memory, at the block cx picks. Learning costs the learner 16
+                // energy, paid to the teacher; teaching is free.
+                let k = (c.cx as usize & 0xF0).min(240);
+                let (from, to): (Vec<u8>, bool) = if op == LEARN {
+                    if self.cs[n].mem.is_empty() || (self.p.energy && c.energy < 16) {
+                        return false;
+                    }
+                    (self.cs[n].mem[k..k + 16].to_vec(), true)
+                } else {
+                    if c.mem.is_empty() {
+                        return false;
+                    }
+                    (c.mem[k..k + 16].to_vec(), false)
+                };
+                if to {
+                    if c.mem.is_empty() {
+                        c.mem = vec![0; 256];
+                    }
+                    c.mem[k..k + 16].copy_from_slice(&from);
+                    if self.p.energy {
+                        c.energy -= 16;
+                        self.cs[n].energy += 16;
+                    }
+                } else {
+                    let m = &mut self.cs[n].mem;
+                    if m.is_empty() {
+                        *m = vec![0; 256];
+                    }
+                    m[k..k + 16].copy_from_slice(&from);
+                }
+                self.stats.lessons += 1;
+            }
+            JOIN => {
+                if !self.p.energy {
+                    return false;
+                }
+                if self.cs[n].group == 0 {
+                    self.cs[n].group = self.cs[n].id;
+                }
+                c.group = self.cs[n].group;
+                self.stats.joins += 1;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Sexual reproduction: from a random point on, the child's cells come from the partner's
+    /// genome instead of the mother's (where the partner is long enough). A partner who has
+    /// died by now contributes nothing.
+    fn crossover(&mut self, s: u32, z: u32, ps: usize, pid: u64) {
+        let Some(p) = self.cs.get(ps).filter(|p| p.alive && p.id == pid) else { return };
+        let (pstart, plen) = (p.start, p.size);
+        let overlap = z.min(plen);
+        if overlap < 2 {
+            return;
+        }
+        let cut = 1 + self.rng.below(overlap as u64 - 1) as u32;
+        let genes: Vec<u8> = self.soup[(pstart + cut) as usize..(pstart + overlap) as usize].to_vec();
+        self.soup[(s + cut) as usize..(s + overlap) as usize].copy_from_slice(&genes);
+    }
+
+    /// A gift: cx units of energy to whoever owns the cell ax points at. Nothing compels a
+    /// return; anything like trade has to evolve on top of it.
+    fn give(&mut self, c: &mut Creature, slot: usize) -> bool {
+        let o = self.owner[(c.ax & self.mask) as usize];
+        if o == 0 || o as usize - 1 == slot {
+            return false;
+        }
+        let amount = (c.cx as u64).min(c.energy);
+        if amount == 0 {
+            return false;
+        }
+        c.energy -= amount;
+        self.cs[o as usize - 1].energy += amount;
+        self.stats.gifts += 1;
+        self.stats.gifted += amount;
+        true
+    }
+
+    /// Who holds a region under feudalism. The first settler founds the line; when a lord
+    /// dies the title passes to its eldest living child in the region, and failing that the
+    /// richest resident seizes it.
+    fn lord_of(&mut self, r: usize) -> Option<usize> {
+        if let Some((slot, id)) = self.titles[r] {
+            if self.cs[slot].alive && self.cs[slot].id == id {
+                return Some(slot);
+            }
+        }
+        let old = self.titles[r].map(|t| t.1);
+        let residents = (0..self.cs.len()).filter(|&i| self.cs[i].alive && (self.cs[i].start / self.region) as usize == r);
+        let heir = residents
+            .clone()
+            .filter(|&i| old.is_some() && self.cs[i].parent == old.unwrap())
+            .min_by_key(|&i| self.cs[i].id)
+            .or_else(|| residents.max_by_key(|&i| (self.cs[i].energy, std::cmp::Reverse(self.cs[i].id))));
+        self.titles[r] = heir.map(|i| (i, self.cs[i].id));
+        heir
+    }
+
+    /// Capitalist land: every resident pays a market rent per cell to the region's deed
+    /// holder, or is evicted. The price follows demand. A resident who can afford the deed
+    /// buys it from the holder. Every movement is a transfer of energy that already exists.
+    fn leases(&mut self, yield_k: u64) {
+        let cells = self.region as u64;
+        let occupied: u64 = self.cs.iter().filter(|c| c.alive).map(|c| c.size as u64).sum();
+        let settled = (0..self.titles.len()).filter(|&r| self.cs.iter().any(|c| c.alive && (c.start / self.region) as usize == r)).count() as u64;
+        let mean = (occupied / settled.max(1)).max(1);
+        for r in 0..self.titles.len() {
+            let residents: Vec<usize> = (0..self.cs.len()).filter(|&i| self.cs[i].alive && (self.cs[i].start / self.region) as usize == r).collect();
+            let used: u64 = residents.iter().map(|&i| self.cs[i].size as u64).sum();
+            // Ground rent: half of what a cell yields, scaled by how sought-after this region
+            // is relative to the average. Crowded land costs more; empty land is cheap.
+            // Capped at 80% of the yield: rent comes out of what the land produces, never more.
+            let price = (yield_k * used.min(mean * 8 / 5) / mean / 2000).max(1);
+            self.prices[r] = price;
+            let holder = match self.titles[r] {
+                Some((slot, id)) if self.cs[slot].alive && self.cs[slot].id == id => Some(slot),
+                _ => None,
+            };
+            let mut evicted = Vec::new();
+            for &i in &residents {
+                if Some(i) == holder {
+                    continue;
+                }
+                let owed = self.cs[i].size as u64 * price;
+                let paid = owed.min(self.cs[i].energy);
+                self.cs[i].energy -= paid;
+                match holder {
+                    Some(h) => self.cs[h].energy += paid,
+                    None => self.pool += paid,
+                }
+                self.stats.rent += paid;
+                if paid < owed {
+                    evicted.push(i);
+                }
+            }
+            for i in evicted {
+                self.stats.evictions += 1;
+                self.kill(i);
+            }
+            // The deed costs twenty epochs of the region's full rent.
+            let deed = price.saturating_mul(cells).saturating_mul(20).max(1);
+            let buyer = (0..self.cs.len())
+                .filter(|&i| self.cs[i].alive && (self.cs[i].start / self.region) as usize == r && Some(i) != holder && self.cs[i].energy > deed)
+                .max_by_key(|&i| (self.cs[i].energy, std::cmp::Reverse(self.cs[i].id)));
+            if let Some(b) = buyer {
+                self.cs[b].energy -= deed;
+                match holder {
+                    Some(h) => self.cs[h].energy += deed,
+                    None => self.pool += deed,
+                }
+                self.titles[r] = Some((b, self.cs[b].id));
+            }
+        }
+    }
+
+    /// Alliances: how many groups with two or more living members, and the largest.
+    pub fn alliances(&self) -> (u32, u32) {
+        let mut sizes: HashMap<u64, u32> = HashMap::new();
+        for c in self.cs.iter().filter(|c| c.alive && c.group != 0) {
+            *sizes.entry(c.group).or_default() += 1;
+        }
+        let real: Vec<u32> = sizes.into_values().filter(|&n| n > 1).collect();
+        (real.len() as u32, real.iter().copied().max().unwrap_or(0))
+    }
+
+    /// Regions with a living title holder, and their mean levy (percent).
+    pub fn titled(&self) -> (u32, f64) {
+        let held: Vec<u64> = (0..self.titles.len())
+            .filter(|&r| matches!(self.titles[r], Some((s, id)) if self.cs[s].alive && self.cs[s].id == id))
+            .map(|r| self.levies[r])
+            .collect();
+        let mean = if held.is_empty() { 0.0 } else { held.iter().sum::<u64>() as f64 / held.len() as f64 };
+        (held.len() as u32, mean)
+    }
+
+    /// Inequality of energy among the living: Gini coefficient and the richest one's share.
+    pub fn wealth(&self) -> (f64, f64) {
+        let mut e: Vec<u64> = self.cs.iter().filter(|c| c.alive).map(|c| c.energy).collect();
+        let total: u128 = e.iter().map(|&x| x as u128).sum();
+        if e.is_empty() || total == 0 {
+            return (0.0, 0.0);
+        }
+        e.sort_unstable();
+        let n = e.len() as f64;
+        let weighted: f64 = e.iter().enumerate().map(|(i, &x)| (i as f64 + 1.0) * x as f64).sum();
+        let gini = 2.0 * weighted / (n * total as f64) - (n + 1.0) / n;
+        (gini, *e.last().unwrap() as f64 / total as f64)
+    }
+
+    /// Starting energy for a founder or migrant, taken from the commons.
+    fn endow(&mut self, slot: usize, amount: u64) {
+        if self.p.energy {
+            let gift = amount.min(self.pool);
+            self.pool -= gift;
+            self.cs[slot].energy += gift;
+        }
+    }
+
+    /// Energy held by creatures plus the commons. In the energy economy this never changes.
+    pub fn ledger(&self) -> u64 {
+        self.pool + self.cs.iter().filter(|c| c.alive).map(|c| c.energy).sum::<u64>()
+    }
+
+    pub fn inject(&mut self, code: &[u8], at: u32) -> u64 {
+        let size = code.len() as u32;
+        for (i, &op) in code.iter().enumerate() {
+            self.soup[(at + i as u32) as usize] = op;
+        }
+        let g = genotype_of(code);
+        let slot = self.spawn(at, size, g, 1, 0);
+        self.endow(slot, 100_000);
+        g
+    }
+
+    fn spawn(&mut self, start: u32, size: u32, genotype: u64, merit: u32, tasks: u16) -> usize {
+        let slot = self.free_slots.pop().unwrap_or_else(|| {
+            self.cs.push(Creature::default());
+            self.cs.len() - 1
+        });
+        self.claim(start, size, slot);
+        self.used += size as u64;
+        let table = match self.jump_tables.get(&genotype).and_then(Weak::upgrade) {
+            Some(t) if t.borrow().len() == size as usize => t,
+            _ => {
+                let t = Rc::new(RefCell::new(vec![UNKNOWN; size as usize]));
+                self.jump_tables.insert(genotype, Rc::downgrade(&t));
+                t
+            }
+        };
+        let c = Creature {
+            id: self.next_id,
+            alive: true,
+            start,
+            size,
+            ip: start,
+            birth: self.birth_seq,
+            genotype,
+            merit,
+            tasks_last: tasks,
+            reap_score: self.birth_seq as i64,
+            cache: Some(table),
+            ..Default::default()
+        };
+        self.reaper.insert((c.reap_score, c.id, slot));
+        self.next_id += 1;
+        self.birth_seq += 1;
+        self.alive += 1;
+        self.cs[slot] = c;
+        slot
+    }
+
+    /// Mark cells as owned. `occ` mirrors `owner` one bit per cell so free space can be
+    /// scanned 64 cells at a time.
+    fn claim(&mut self, start: u32, size: u32, slot: usize) {
+        for a in start..start + size {
+            self.owner[a as usize] = slot as u32 + 1;
+            self.occ[(a / 64) as usize] |= 1 << (a % 64);
+        }
+    }
+
+    fn release(&mut self, start: u32, size: u32) {
+        for a in start..start + size {
+            self.owner[a as usize] = 0;
+            self.occ[(a / 64) as usize] &= !(1u64 << (a % 64));
+        }
+        self.used -= size as u64;
+    }
+
+    /// Free cells and scramble them: dead bodies decay. Without this, whole populations
+    /// came to run one dead creature's leftover copy loop, and when a newcomer was
+    /// allocated over it every lineage failed at once and the world went extinct.
+    fn random_op(&mut self) -> u8 {
+        self.ops[self.rng.below(self.ops.len() as u64) as usize]
+    }
+
+    /// The op a mutation writes at `at`. With learned mutation on, some draws come from
+    /// what follows the two cells before `at` in genomes that persisted, so mutants look
+    /// like code that has worked (estimation of distribution). The rest stay uniform.
+    fn mutant_op(&mut self, at: u32) -> u8 {
+        if self.p.learned_mut > 0 && self.rng.below(100) < self.p.learned_mut as u64 {
+            let (a, b) = (self.at(at.wrapping_sub(2)) as usize, self.at(at.wrapping_sub(1)) as usize);
+            let row = &self.model[(a << 6 | b) << 6..][..64];
+            let total: u64 = row.iter().map(|&n| n as u64).sum();
+            if total > 0 {
+                let mut r = self.rng.below(total);
+                for (op, &n) in row.iter().enumerate() {
+                    if r < n as u64 {
+                        return op as u8;
+                    }
+                    r -= n as u64;
+                }
+            }
+        }
+        self.random_op()
+    }
+
+    /// Teach the mutation model genomes that just proved they persist. Old counts halve
+    /// as new ones come in, so the model follows what works now.
+    pub fn train(&mut self, genomes: &[Vec<u8>]) {
+        if self.model.is_empty() {
+            return;
+        }
+        for g in genomes {
+            for w in g.windows(3) {
+                self.model[((w[0] as usize & 63) << 6 | w[1] as usize & 63) << 6 | w[2] as usize & 63] += 1;
+                self.model_total += 1;
+            }
+        }
+        if self.model_total > 1 << 22 {
+            self.model.iter_mut().for_each(|n| *n /= 2);
+            self.model_total = self.model.iter().map(|&n| n as u64).sum();
+        }
+    }
+
+    fn decay(&mut self, start: u32, size: u32) {
+        self.release(start, size);
+        for a in start..start + size {
+            self.soup[a as usize] = self.random_op();
+        }
+    }
+
+    fn kill(&mut self, slot: usize) {
+        prof::time(prof::KILL, || self.kill_inner(slot))
+    }
+
+    fn kill_inner(&mut self, slot: usize) {
+        let c = std::mem::take(&mut self.cs[slot]);
+        self.reaper.remove(&(c.reap_score, c.id, slot));
+        self.pool += c.energy;
+        self.decay(c.start, c.size);
+        if let Some((s, z)) = c.child {
+            self.decay(s, z + self.slack());
+        }
+        self.alive -= 1;
+        self.free_slots.push(slot);
+        self.events.push(Event::Death { genotype: c.genotype });
+    }
+
+    /// Kill whoever is at the top of the reaper queue, sparing `spare`.
+    fn reap_one(&mut self, spare: usize) -> bool {
+        let victim = self.reaper.iter().find(|k| k.2 != spare).map(|k| k.2);
+        match victim {
+            Some(v) => {
+                self.stats.died_reaped += 1;
+                self.kill(v);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A free run of `size` cells starting within `window` cells after `from`.
+    fn find_free(&self, from: u32, size: u32, window: u32) -> Option<u32> {
+        prof::time(prof::FIND_FREE, || self.find_free_inner(from, size, window))
+    }
+
+    fn find_free_inner(&self, from: u32, size: u32, window: u32) -> Option<u32> {
+        let (n, mut i, mut run, mut run_start) = (self.n, from, 0u32, from);
+        let limit = window.min(n) as u64 + size as u64;
+        let mut scanned = 0u64;
+        while scanned < limit {
+            if i == n {
+                // Blocks never wrap around the end of the soup.
+                i = 0;
+                run = 0;
+            }
+            // Jump over a whole stretch of owned or free cells at once, read off the
+            // occupancy bits. Same answer as a cell-by-cell scan, far fewer steps.
+            let bit = i % 64;
+            let w = self.occ[(i / 64) as usize] >> bit;
+            let avail = (64 - bit as u64).min(limit - scanned).min((n - i) as u64) as u32;
+            if w & 1 == 1 {
+                let k = w.trailing_ones().min(avail);
+                run = 0;
+                i += k;
+                scanned += k as u64;
+            } else {
+                let k = w.trailing_zeros().min(avail);
+                if run == 0 {
+                    run_start = i;
+                }
+                if run + k >= size {
+                    return Some(run_start);
+                }
+                run += k;
+                i += k;
+                scanned += k as u64;
+            }
+        }
+        None
+    }
+
+    fn in_sun(&self, a: u32) -> bool {
+        let d = a.wrapping_sub(self.weather.sun_center) & self.mask;
+        d.min(self.n - d) <= self.weather.sun_half
+    }
+
+    /// Run until `budget` more instructions have executed. Round-robin, and each
+    /// creature's slice is its own size, so being big buys no extra speed.
+    pub fn run(&mut self, budget: u64) {
+        let target = self.instr + budget;
+        let mut idle_run = 0;
+        while self.instr < target {
+            if self.alive == 0 || idle_run > self.cs.len() {
+                return;
+            }
+            if self.rr >= self.cs.len() {
+                self.rr = 0;
+            }
+            let slot = self.rr;
+            self.rr += 1;
+            if !self.cs[slot].alive {
+                continue;
+            }
+            let mut c = std::mem::take(&mut self.cs[slot]);
+            let sun = if self.in_sun(c.start) { self.p.sun_bonus } else { 1 };
+            let slice = if self.p.energy {
+                // Running costs energy. Wealth buys speed: a turn is two body-lengths times the
+                // creature's balance relative to the mean (1x to 64x), as far as the balance goes.
+                // Without this, earning more bought nothing, and tiny fast breeders won.
+                let rel = (c.energy.saturating_mul(1_000_000) / self.merit_mean_k).clamp(1000, 64_000);
+                let s = c.energy.min(c.size as u64 * 2 * sun * rel / 1000);
+                c.energy -= s;
+                self.pool += s;
+                s
+            } else {
+                let rel = (c.merit.max(1) as u64 * 1000 * 1000 / self.merit_mean_k).clamp(1, 64_000);
+                (c.size as u64 * rel / 1000).max(1) * sun
+            };
+            if slice == 0 {
+                // Broke: it sleeps until the next payout. Killing after a few broke turns, with
+                // income arriving once an epoch, starved whole populations in a single epoch.
+                c.idle += 1;
+                idle_run += 1;
+                self.cs[slot] = c;
+                continue;
+            }
+            idle_run = 0;
+            c.idle = 0;
+            for _ in 0..slice {
+                self.step(&mut c, slot);
+            }
+            c.age += slice;
+            let old = self.p.max_age > 0 && c.age > self.p.max_age * c.size as u64;
+            self.cs[slot] = c;
+            // Old age: without it, a world where nobody can fit a child never turns over.
+            if old {
+                self.stats.died_old += 1;
+                self.kill(slot);
+            }
+        }
+    }
+
+    fn error(&mut self, c: &mut Creature, slot: usize) {
+        c.errors += 1;
+        self.reaper.remove(&(c.reap_score, c.id, slot));
+        c.reap_score -= ERROR_WEIGHT;
+        self.reaper.insert((c.reap_score, c.id, slot));
+    }
+
+    fn cosmic_ray(&mut self, c: &mut Creature, slot: usize) {
+        let a = self.rng.below(self.n as u64) as usize;
+        self.soup[a] = self.mutant_op(a as u32);
+        // Whoever was hit no longer matches its genotype's jump table. The running
+        // creature is out of `cs` while it runs, so it is marked directly.
+        match self.owner[a] {
+            0 => {}
+            o if o as usize - 1 == slot => c.dirty = true,
+            o => self.cs[o as usize - 1].dirty = true,
+        }
+        let iv = self.weather.cosmic_interval.max(1);
+        self.next_cosmic = self.instr + 1 + self.rng.below(2 * iv);
+    }
+
+    #[inline]
+    fn at(&self, a: u32) -> u8 {
+        self.soup[(a & self.mask) as usize]
+    }
+
+    /// The nop run starting at `a`, as bits, and its length.
+    fn template(&self, a: u32) -> (u32, u32) {
+        let (mut bits, mut len) = (0u32, 0u32);
+        while len < MAX_TEMPLATE {
+            let op = self.at(a + len);
+            if op > NOP1 {
+                break;
+            }
+            bits |= (op as u32) << len;
+            len += 1;
+        }
+        (bits, len)
+    }
+
+    fn matches(&self, q: u32, bits: u32, len: u32) -> bool {
+        (0..len).all(|i| self.at(q + i) as u32 == ((bits >> i) & 1) ^ 1)
+    }
+
+    /// Find the complement of a template. Returns the address just past it.
+    /// `fwd_from` is where a forward search starts, `back_from` is the instruction itself.
+    /// Also returns how many steps out it looked before finding the match.
+    fn search(&self, bits: u32, len: u32, fwd_from: u32, back_from: u32, fwd: bool, back: bool) -> Option<(u32, u32)> {
+        for k in 0..self.p.search_limit {
+            if fwd {
+                let q = fwd_from.wrapping_add(k);
+                if self.matches(q, bits, len) {
+                    return Some(((q + len) & self.mask, k));
+                }
+            }
+            if back {
+                let q = back_from.wrapping_sub(len + k);
+                if self.matches(q, bits, len) {
+                    return Some(((q.wrapping_add(len)) & self.mask, k));
+                }
+            }
+        }
+        None
+    }
+
+    /// `search`, remembered per genotype. An answer is stored only if every cell the
+    /// search looked at lies inside the creature's own body: then it depends on the
+    /// genome alone and every sibling with an unchanged body gets the same answer.
+    fn search_cached(&self, c: &Creature, p: u32, bits: u32, len: u32, fwd_from: u32, fwd: bool, back: bool) -> Option<u32> {
+        let off = p.wrapping_sub(c.start);
+        let table = match &c.cache {
+            Some(t) if !c.dirty && off < c.size => t,
+            _ => return self.search(bits, len, fwd_from, p, fwd, back).map(|r| r.0),
+        };
+        let known = table.borrow()[off as usize];
+        if known != UNKNOWN {
+            return Some((c.start + known) & self.mask);
+        }
+        let found = self.search(bits, len, fwd_from, p, fwd, back);
+        if let Some((a, k)) = found {
+            let (lo, hi) = (c.start as i64, (c.start + c.size) as i64);
+            let low = if back { p as i64 - len as i64 - k as i64 } else { fwd_from as i64 };
+            // The template itself, and the cell that ended it, count as looked at too.
+            let high = if fwd { fwd_from as i64 + k as i64 + len as i64 } else { p as i64 }.max(fwd_from as i64 + 1);
+            if low >= lo && high <= hi {
+                table.borrow_mut()[off as usize] = (a as i64 - lo) as u32;
+            }
+        }
+        found.map(|r| r.0)
+    }
+
+    fn step(&mut self, c: &mut Creature, slot: usize) {
+        let p = c.ip & self.mask;
+        let op = self.soup[p as usize];
+        self.instr += 1;
+        if self.instr >= self.next_cosmic {
+            self.cosmic_ray(c, slot);
+        }
+        if !c.owns(p) {
+            c.ran_foreign = true;
+        }
+        let mut next = p.wrapping_add(1);
+        if op >= 64 || self.enabled & 1 << op == 0 {
+            self.error(c, slot);
+            c.ip = next & self.mask;
+            return;
+        }
+        match op {
+            NOP0 | NOP1 => {}
+            // Junk costs space, not time: a run of nopx is stepped over in one instruction.
+            // Otherwise empty scratch space is a small tax that selection strips away
+            // before anything useful can evolve in it.
+            NOPX => {
+                let mut k = 0;
+                while k < 255 && self.at(next) == NOPX {
+                    next = next.wrapping_add(1);
+                    k += 1;
+                }
+            }
+            OR1 => c.cx ^= 1,
+            SHL => c.cx <<= 1,
+            ZERO => c.cx = 0,
+            IF_CZ => {
+                if c.cx != 0 {
+                    next = p.wrapping_add(2);
+                }
+            }
+            SUB_AB => c.cx = c.ax.wrapping_sub(c.bx),
+            SUB_AC => c.ax = c.ax.wrapping_sub(c.cx),
+            INC_A => c.ax = c.ax.wrapping_add(1),
+            INC_B => c.bx = c.bx.wrapping_add(1),
+            DEC_C => c.cx = c.cx.wrapping_sub(1),
+            INC_C => c.cx = c.cx.wrapping_add(1),
+            PUSH_AX | PUSH_BX | PUSH_CX | PUSH_DX => {
+                let v = [c.ax, c.bx, c.cx, c.dx][(op - PUSH_AX) as usize];
+                c.stack[c.sp as usize] = v;
+                c.sp = (c.sp + 1) % STACK as u8;
+            }
+            POP_AX | POP_BX | POP_CX | POP_DX => {
+                c.sp = (c.sp + STACK as u8 - 1) % STACK as u8;
+                let v = c.stack[c.sp as usize];
+                match op {
+                    POP_AX => c.ax = v,
+                    POP_BX => c.bx = v,
+                    POP_CX => c.cx = v,
+                    _ => c.dx = v,
+                }
+            }
+            JMP | JMPB | CALL | ADR | ADRB | ADRF => {
+                let (bits, len) = self.template(p + 1);
+                next = p.wrapping_add(1 + len);
+                if len == 0 {
+                    self.error(c, slot);
+                } else {
+                    let (f, b) = match op {
+                        JMPB | ADRB => (false, true),
+                        ADRF => (true, false),
+                        _ => (true, true),
+                    };
+                    match prof::time(prof::SEARCH, || self.search_cached(c, p, bits, len, next, f, b)) {
+                        None => self.error(c, slot),
+                        Some(a) => match op {
+                            JMP | JMPB => next = a,
+                            CALL => {
+                                c.stack[c.sp as usize] = next;
+                                c.sp = (c.sp + 1) % STACK as u8;
+                                next = a;
+                            }
+                            _ => c.ax = a,
+                        },
+                    }
+                }
+            }
+            RET => {
+                c.sp = (c.sp + STACK as u8 - 1) % STACK as u8;
+                next = c.stack[c.sp as usize];
+            }
+            MOV_CD => c.dx = c.cx,
+            MOV_AB => c.bx = c.ax,
+            MOV_IAB => {
+                let dst = c.ax & self.mask;
+                if c.owns(dst) {
+                    let mut v = self.at(c.bx);
+                    if self.rng.below(self.p.copy_error) == 0 {
+                        v = self.mutant_op(dst);
+                    }
+                    self.soup[dst as usize] = v;
+                    let mine = |a: u32| a >= c.start && a < c.start + c.size;
+                    if !mine(dst) {
+                        // Only copying from her own body counts toward a child. Counting
+                        // any write let lineages copy their head, fill the rest with the
+                        // child's leftover junk, and make every child a new genotype.
+                        // And each cell counts once: writing the first half twice left the
+                        // second half as junk, with the same effect.
+                        if !self.p.lean {
+                            c.child_writes += 1;
+                        } else if mine(c.bx & self.mask) {
+                            let i = c.child.map_or(usize::MAX, |(s, _)| dst.wrapping_sub(s) as usize);
+                            if i >= 512 || c.child_seen[i / 64] >> (i % 64) & 1 == 0 {
+                                if i < 512 {
+                                    c.child_seen[i / 64] |= 1 << (i % 64);
+                                }
+                                c.child_writes += 1;
+                            }
+                        }
+                    } else {
+                        c.dirty = true;
+                    }
+                } else {
+                    self.error(c, slot);
+                }
+            }
+            NAND => c.cx = !(c.cx & c.dx),
+            IO => self.io(c),
+            LOAD | STORE if !self.p.memory => self.error(c, slot),
+            LOAD => {
+                c.cx = c.mem.get(c.cx as usize & 255).copied().unwrap_or(0) as u32;
+            }
+            STORE => {
+                if c.mem.is_empty() {
+                    c.mem = vec![0; 256];
+                }
+                c.mem[c.dx as usize & 255] = c.cx as u8;
+            }
+            INFECT => {
+                let (bits, len) = self.template(p + 1);
+                next = p.wrapping_add(1 + len);
+                if !self.p.infect || !self.infect(c, slot, bits, len) {
+                    self.error(c, slot);
+                }
+            }
+            GUESS => {
+                c.guess = c.cx as u8;
+                c.has_guess = true;
+            }
+            DIVE => {
+                let reading = if c.reef_mode {
+                    self.reef_read(c)
+                } else if self.ocean.is_empty() {
+                    None
+                } else {
+                    let b = self.ocean[c.pos as usize % self.ocean.len()];
+                    c.pos = c.pos.wrapping_add(1);
+                    Some((b, None))
+                };
+                match reading {
+                    None => self.error(c, slot),
+                    Some((b, from)) => {
+                        // The byte before lands in dx, the new one in cx. Then `store` files
+                        // "what came after the last byte" and `load` looks up "what came after
+                        // this one": a learner is just `store load guess dive`, and `store`
+                        // alone is harmless, so there is a neutral first step toward it.
+                        c.dx = c.prev as u32;
+                        c.prev = b;
+                        if c.has_guess {
+                            let s = 4 - (c.guess ^ b).count_ones() as i32;
+                            c.scored += 1;
+                            c.hits += (c.guess == b) as u32;
+                            c.has_guess = false;
+                            match from {
+                                None => c.bits += s,
+                                Some(e) => self.reef_score(c, e, s),
+                            }
+                        }
+                        c.cx = b as u32;
+                    }
+                }
+            }
+            EMIT | TUNE if !self.p.reef => self.error(c, slot),
+            EMIT => {
+                let r = &mut self.reefs[(c.start / self.region) as usize];
+                let i = (r.written % REEF_CAP as u64) as usize;
+                r.data[i] = c.cx as u8;
+                r.from[i] = Emitter { slot: slot as u32, id: c.id, genotype: c.genotype };
+                r.written += 1;
+                self.stats.emits += 1;
+            }
+            TUNE => c.reef_mode = !c.reef_mode,
+            ENCLOSE | LEVY | REVOLT => {
+                if self.p.regime != Regime::Evolved || !self.politics(c, slot, op) {
+                    self.error(c, slot);
+                }
+            }
+            MATE | LEARN | TEACH | JOIN => {
+                if !self.social(c, slot, op) {
+                    self.error(c, slot);
+                }
+            }
+            GIVE => {
+                if !self.p.energy || !self.give(c, slot) {
+                    self.error(c, slot);
+                }
+            }
+            MAL => prof::time(prof::MAL, || self.mal(c, slot)),
+            DIVIDE => prof::time(prof::DIVIDE, || self.divide(c, slot)),
+            SENSE => {
+                let d = self.weather.sun_center.wrapping_sub(p) & self.mask;
+                let signed = if d >= self.n / 2 { d as i64 - self.n as i64 } else { d as i64 };
+                c.dx = (signed / 16) as i32 as u32;
+                c.sensed = true;
+            }
+            _ => self.error(c, slot),
+        }
+        c.ip = next & self.mask;
+    }
+
+    fn mal(&mut self, c: &mut Creature, slot: usize) {
+        let size = c.cx;
+        if size < self.p.min_size || size > self.p.max_size {
+            self.error(c, slot);
+            return;
+        }
+        if let Some((s, z)) = c.child.take() {
+            self.decay(s, z + self.slack());
+        }
+        c.child_writes = 0;
+        c.child_seen = [0; 8];
+        let need = size + self.slack();
+        let limit = (self.p.fill * self.n as f64) as u64;
+        while self.used + need as u64 > limit {
+            if !self.reap_one(slot) {
+                break;
+            }
+        }
+        let target = (c.start as i64 + (c.dx as i32 as i64) * 16).rem_euclid(self.n as i64) as u32;
+        // Look near the mother first, then in a few random spots. Each look is bounded,
+        // so a birth usually costs the same in a crowded soup as in an empty one. Only
+        // if all of them miss does it pay for a full scan. Like Tierra, nobody is reaped
+        // just to defragment: that let one mutant calling mal in a loop wipe out a world.
+        let window = (need * 8).max(SEARCH_WINDOW);
+        let mut spot = self.find_free(target, need, window);
+        for _ in 0..8 {
+            if spot.is_some() {
+                break;
+            }
+            let from = self.rng.below(self.n as u64) as u32;
+            spot = self.find_free(from, need, window);
+        }
+        if spot.is_none() {
+            spot = self.find_free(target, need, self.n);
+        }
+        match spot {
+            Some(a) => {
+                self.claim(a, need, slot);
+                self.used += need as u64;
+                c.child = Some((a, size));
+                c.ax = a;
+            }
+            None => self.error(c, slot),
+        }
+    }
+
+    fn divide(&mut self, c: &mut Creature, slot: usize) {
+        let Some((s, z)) = c.child else {
+            self.error(c, slot);
+            return;
+        };
+        // A child must be (nearly) all copied. At 1/2, a miscounted size gave oversized
+        // children padded with junk that still lived, while undersized ones died, so
+        // genome size ratcheted up into giants. Growth now comes from unbiased indels.
+        // Lean: every cell. With 1/8 slack, lineages learned to skip copying their last
+        // eighth (9% faster), so each child kept different leftover junk there, every birth
+        // was a new genotype, and the novelty measure read zero.
+        let need = if self.p.lean { z } else { z - z / 8 };
+        if c.child_writes < need {
+            self.error(c, slot);
+            return;
+        }
+        // The block changes hands: release it from the mother, give it to the child.
+        c.child = None;
+        c.child_writes = 0;
+        c.child_seen = [0; 8];
+        self.release(s, z + self.slack());
+        let resized = z != c.size;
+        let (z, indels) = self.indel(s, z);
+        if let Some((ps, pid)) = c.mate.take() {
+            self.crossover(s, z, ps as usize, pid);
+        }
+        let g = genotype_of(&self.soup[s as usize..(s + z) as usize]);
+        let mother_now = genotype_of(&self.soup[c.start as usize..(c.start + c.size) as usize]);
+        let count = |w: &World, a: u32, n: u32| w.soup[a as usize..(a + n) as usize].iter().filter(|&&o| o == NOPX).count() as u64;
+        let (m_nopx, c_nopx) = (count(self, c.start, c.size), count(self, s, z));
+        let st = &mut self.stats;
+        st.births += 1;
+        st.mother_nopx += m_nopx;
+        st.resized += resized as u64;
+        if c_nopx > m_nopx {
+            st.gained += c_nopx - m_nopx;
+        } else {
+            let lost = m_nopx - c_nopx;
+            if resized {
+                st.lost_resize += lost;
+            } else if indels {
+                st.lost_indel += lost;
+            } else {
+                st.lost_point += lost;
+            }
+        }
+        // What this cycle's work earned is paid to both, for the next cycle.
+        let mut merit = 1u32;
+        if self.p.tasks {
+            let paid = c.tasks_now & self.weather.rewarded;
+            for (t, bonus) in TASK_BONUS.iter().enumerate() {
+                if paid >> t & 1 == 1 {
+                    merit = merit.saturating_mul(*bonus).min(self.p.max_merit);
+                }
+            }
+        }
+        // The ocean pays for correct predictions of bytes the creature had not yet read.
+        if self.p.ocean_div > 0 && !self.ocean.is_empty() {
+            // Scored bit by bit, the way PAQ-style compressors predict: each guess earns the
+            // bits it got right minus 4, so random guessing earns nothing, knowing the kind
+            // of character earns a little, and the exact byte earns most. Every step of
+            // better prediction pays. Four net bits buy one unit of merit.
+            let net = (c.bits + c.emit_bits).max(0) as u32;
+            let bonus = (1 + net / (4 * self.p.ocean_div)).min(self.p.ocean_cap);
+            merit = merit.saturating_mul(bonus).min(self.p.max_merit);
+        }
+        // Score for this cycle: ocean bits plus the logic tasks that pay right now. In the
+        // energy economy it only weights the next payout; it never creates energy.
+        let task_pts: u64 = if self.p.tasks {
+            let paid = c.tasks_now & self.weather.rewarded;
+            TASK_BONUS.iter().enumerate().filter(|(t, _)| paid >> t & 1 == 1).map(|(_, b)| *b as u64).sum()
+        } else {
+            0
+        };
+        c.score += c.bits.max(0) as u64 + task_pts;
+        let child = self.spawn(s, z, g, merit, c.tasks_now);
+        if self.p.energy {
+            // A child starts with half of its mother's energy.
+            let gift = c.energy / 2;
+            c.energy -= gift;
+            self.cs[child].energy = gift;
+            self.cs[child].parent = c.id;
+        }
+        // The child swims on from where its mother stopped reading.
+        let ch = &mut self.cs[child];
+        ch.pos = c.pos;
+        ch.hits_last = c.hits;
+        ch.scored_last = c.scored;
+        ch.bits_last = c.bits;
+        ch.mem = c.mem.clone();
+        ch.prev = c.prev;
+        ch.reef_mode = c.reef_mode;
+        self.events.push(Event::Birth {
+            mother: c.genotype,
+            mother_now,
+            child: g,
+            child_size: z,
+            foreign: c.ran_foreign,
+            sensed: c.sensed,
+            tasks: c.tasks_now,
+        });
+        c.merit = merit;
+        c.tasks_last = c.tasks_now;
+        c.tasks_now = 0;
+        c.infected = false;
+        c.hits_last = c.hits;
+        c.scored_last = c.scored;
+        c.hits = 0;
+        c.scored = 0;
+        c.bits_last = c.bits;
+        c.bits = 0;
+        c.emit_bits = 0;
+        c.ran_foreign = false;
+        c.sensed = false;
+    }
+
+    /// With indels on, every child block comes with one spare cell so an insertion always
+    /// has room. Without it, deletions would always succeed and insertions rarely, and
+    /// genomes would shrink for no reason but bookkeeping.
+    fn slack(&self) -> u32 {
+        (self.p.indel > 0) as u32
+    }
+
+    /// Insertion and deletion mutations, so genomes can grow and shrink by more than
+    /// a miscounted size. Returns the child's new size.
+    fn indel(&mut self, s: u32, z: u32) -> (u32, bool) {
+        if self.p.indel == 0 {
+            return (z, false);
+        }
+        let z0 = z;
+        let mut z = z;
+        if self.rng.below(self.p.indel) == 0 && z > self.p.min_size {
+            let at = s + self.rng.below(z as u64) as u32;
+            self.soup.copy_within(at as usize + 1..(s + z) as usize, at as usize);
+            z -= 1;
+            self.indel_hit = true;
+        }
+        let end = s + z;
+        if self.rng.below(self.p.indel) == 0 && z < self.p.max_size && end < self.n && self.owner[end as usize] == 0 {
+            let at = s + self.rng.below(z as u64 + 1) as u32;
+            self.soup.copy_within(at as usize..end as usize, at as usize + 1);
+            self.soup[at as usize] = self.mutant_op(at);
+            z += 1;
+        }
+        // A deletion followed by an insertion leaves the size alone but still counts.
+        let touched = z != z0 || self.indel_hit;
+        self.indel_hit = false;
+        (z, touched)
+    }
+
+    /// Output cx, then read the next number from the outside into cx. If the output
+    /// is a logic function of numbers this creature has read, that task counts.
+    /// Next unread byte of the local reef, and who emitted it. Readers that fall behind skip
+    /// to the oldest byte still kept; a reader that has caught up has nothing to read.
+    fn reef_read(&mut self, c: &mut Creature) -> Option<(u8, Option<Emitter>)> {
+        let r = &self.reefs[(c.start / self.region) as usize];
+        c.reef_pos = c.reef_pos.max(r.written.saturating_sub(REEF_CAP as u64));
+        if c.reef_pos >= r.written {
+            return None;
+        }
+        let i = (c.reef_pos % REEF_CAP as u64) as usize;
+        c.reef_pos += 1;
+        self.stats.reef_reads += 1;
+        Some((r.data[i], Some(r.from[i])))
+    }
+
+    /// Who earns a reef prediction. Your own bytes earn nothing. A relative predicting you
+    /// pays you (signalling to kin). Predicting a rival pays you and costs them (decoding
+    /// the enemy), so a signal anyone can read is a liability.
+    fn reef_score(&mut self, c: &mut Creature, e: Emitter, s: i32) {
+        if e.id == c.id {
+            return;
+        }
+        let kin = e.genotype == c.genotype;
+        if self.p.energy {
+            // Decoding a rival takes energy from it, at most what it has; kin pay nothing.
+            if !kin && s > 0 {
+                if let Some(m) = self.cs.get_mut(e.slot as usize).filter(|m| m.alive && m.id == e.id) {
+                    let t = (s as u64).min(m.energy);
+                    m.energy -= t;
+                    c.energy += t;
+                }
+            }
+            if kin {
+                self.stats.kin_reads += 1;
+            }
+            return;
+        }
+        if kin {
+            self.stats.kin_reads += 1;
+        } else {
+            c.bits += s;
+        }
+        if let Some(m) = self.cs.get_mut(e.slot as usize).filter(|m| m.alive && m.id == e.id) {
+            m.emit_bits += if kin { s } else { -s };
+        }
+    }
+
+    /// The Red Queen. A creature can take half the CPU share of a neighbour that does a
+    /// logic task it also does, once per cycle. Common ways of making a living get
+    /// hunted, so rare and new ones pay. ECHO doesn't count: everyone can do it.
+    fn infect(&mut self, c: &mut Creature, slot: usize, bits: u32, len: u32) -> bool {
+        if c.infected {
+            return false;
+        }
+        let o = self.owner[(c.ax & self.mask) as usize];
+        if o == 0 || o as usize - 1 == slot {
+            return false;
+        }
+        let d = c.start.wrapping_sub(self.cs[o as usize - 1].start) & self.mask;
+        if d.min(self.n - d) > self.p.infect_radius {
+            return false;
+        }
+        let (vs, vz) = (self.cs[o as usize - 1].start, self.cs[o as usize - 1].size);
+        let matched = if self.p.tasks {
+            c.tasks_last & self.cs[o as usize - 1].tasks_last & 0x1FF != 0
+        } else {
+            // Without the task economy there are no shared tasks to target. Then infection is
+            // Tierra's lock and key: the template after `infect` must find its complement
+            // somewhere in the victim's body. Hosts can evolve the lock away, parasites a new key.
+            len > 0 && vz >= len && (vs..=vs + vz - len).any(|q| self.matches(q, bits, len))
+        };
+        let v = &mut self.cs[o as usize - 1];
+        if self.p.energy {
+            // Theft moves energy that exists; it never makes any.
+            if !matched || v.energy < 2 {
+                return false;
+            }
+            let take = v.energy / 2;
+            v.energy -= take;
+            c.energy += take;
+        } else {
+            if !matched || v.merit < 2 {
+                return false;
+            }
+            let take = v.merit / 2;
+            v.merit -= take;
+            c.merit = (c.merit + take).min(self.p.max_merit);
+        }
+        c.infected = true;
+        self.stats.infections += 1;
+        true
+    }
+
+    fn io(&mut self, c: &mut Creature) {
+        let v = c.cx;
+        let n = (c.reads as usize).min(3);
+        for i in 0..n {
+            let a = c.inputs[i];
+            if v == !a {
+                c.tasks_now |= 1;
+            }
+            if v == a {
+                c.tasks_now |= 1 << 9;
+            }
+            for j in (0..n).filter(|&j| j != i) {
+                for (t, &o) in task_outputs(a, c.inputs[j]).iter().enumerate().skip(1) {
+                    if v == o {
+                        c.tasks_now |= 1 << t;
+                    }
+                }
+            }
+        }
+        let mut x = self.weather.data
+            ^ c.id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (c.reads as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 31)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 29;
+        // Avida's trick: each input's top byte is a fixed pattern, so every logic function
+        // of two inputs leaves a different fingerprint and nothing matches by coincidence.
+        let k = c.reads as usize % 3;
+        let v = (x as u32 & 0x00FF_FFFF) | ([0x0F, 0x33, 0x55][k] << 24);
+        c.inputs[k] = v;
+        c.reads = c.reads.wrapping_add(1);
+        c.cx = v;
+    }
+
+    /// Cells the bookkeeping says are in use, and cells actually owned. They must agree.
+    pub fn audit(&self) -> (u64, u64) {
+        (self.used, self.owner.iter().filter(|&&o| o != 0).count() as u64)
+    }
+
+    pub fn genome(&self, c: &Creature) -> &[u8] {
+        &self.soup[c.start as usize..(c.start + c.size) as usize]
+    }
+
+    /// Everything that determines the future, hashed. Two honest replays agree on this.
+    pub fn state_hash(&self) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(&self.soup);
+        h.update(&self.rng.state_bytes());
+        h.update(&self.instr.to_le_bytes());
+        h.update(&self.next_cosmic.to_le_bytes());
+        h.update(&[self.weather.goal]);
+        h.update(&self.pool.to_le_bytes());
+        for l in &self.levies {
+            h.update(&l.to_le_bytes());
+        }
+        for (t, p) in self.titles.iter().zip(&self.prices) {
+            let (s, i) = t.map(|(s, i)| (s as u64, i)).unwrap_or((u64::MAX, 0));
+            h.update(&s.to_le_bytes());
+            h.update(&i.to_le_bytes());
+            h.update(&p.to_le_bytes());
+        }
+        for r in &self.reefs {
+            h.update(&r.written.to_le_bytes());
+            h.update(&r.data);
+        }
+        h.update(&(self.rr as u64).to_le_bytes());
+        for c in self.cs.iter().filter(|c| c.alive) {
+            for v in [c.id, c.start as u64, c.size as u64, c.ip as u64, c.birth, c.errors as u64, c.age] {
+                h.update(&v.to_le_bytes());
+            }
+            for v in [c.ax, c.bx, c.cx, c.dx, c.sp as u32, c.merit, c.tasks_now as u32, c.reads, c.pos, c.hits, c.scored, c.bits as u32, c.prev as u32, c.infected as u32, c.reef_mode as u32, c.reef_pos as u32, c.emit_bits as u32, c.energy as u32, (c.energy >> 32) as u32, c.score as u32, c.idle, c.group as u32, c.mate.map(|m| m.1 as u32).unwrap_or(u32::MAX), c.guess as u32 | (c.has_guess as u32) << 8] {
+                h.update(&v.to_le_bytes());
+            }
+            for v in c.stack.iter().chain(c.inputs.iter()) {
+                h.update(&v.to_le_bytes());
+            }
+            let (s, z) = c.child.unwrap_or((u32::MAX, 0));
+            h.update(&s.to_le_bytes());
+            h.update(&z.to_le_bytes());
+            h.update(&c.child_writes.to_le_bytes());
+            h.update(&c.mem);
+        }
+        *h.finalize().as_bytes()
+    }
+}

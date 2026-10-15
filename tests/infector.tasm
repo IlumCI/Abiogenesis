@@ -1,0 +1,48 @@
+nop1 nop1 nop1 nop1
+zero
+or1
+shl
+shl
+mov_cd
+adrb nop0 nop0 nop0 nop0
+sub_ac
+mov_ab
+adrf nop0 nop0 nop0 nop1
+inc_a
+sub_ab nop1 nop1 nop0 nop1
+push_bx
+push_cx
+io
+push_cx
+pop_dx
+io
+nand
+io
+push_dx
+pop_cx
+nand
+io
+infect
+pop_cx
+pop_bx
+mal
+call nop0 nop0 nop1 nop1
+divide
+jmpb nop0 nop0 nop1 nop0
+if_cz nop1 nop1 nop0 nop0
+push_ax
+push_bx
+push_cx nop1 nop0 nop1 nop0
+mov_iab
+dec_c
+if_cz
+jmp nop0 nop1 nop0 nop0
+inc_a
+inc_b
+jmp nop0 nop1 nop0 nop1
+if_cz nop1 nop0 nop1 nop1
+pop_cx
+pop_bx
+pop_ax
+ret nop1 nop1 nop1 nop0
+if_cz
