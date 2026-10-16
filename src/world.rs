@@ -10,6 +10,8 @@ use std::rc::{Rc, Weak};
 
 const STACK: usize = 10;
 const MAX_TEMPLATE: u32 = 6;
+/// Cells at the start of a body that predators' keys are matched against.
+const SURFACE: u32 = 8;
 /// One error ages a creature by this many births in the reaper's eyes.
 const ERROR_WEIGHT: i64 = 4;
 /// How far `mal` scans for free space per look.
@@ -115,6 +117,18 @@ pub struct Params {
     /// into the commons at divide, whatever the cells hold. A mother that can't pay
     /// can't divide yet. Prices corner-cutting instead of banning it. 0 = free.
     pub birth_cost: u64,
+    /// v5 ecology, each switchable alone. Predation: `eat KEY` kills the creature whose body
+    /// holds ax (or the next one ahead within `radius`) if KEY's complement is on its
+    /// surface (first SURFACE cells), taking all its energy; one kill per cycle.
+    pub predation: bool,
+    /// Local world: children go near the mother, and room is made by reaping a neighbour.
+    pub local: bool,
+    /// Every child crosses over with the nearest creature of about its size (within 1/8).
+    pub sex: bool,
+    /// The neighbour reaped for room is the poorest, not the oldest.
+    pub reap_poor: bool,
+    /// How far, in cells, births, reaping, mates and prey reach under v5.
+    pub radius: u32,
 }
 
 /// Size of the order-2 memory, and where a two-byte context lands in it.
@@ -127,11 +141,20 @@ fn mem2_index(ctx: u32) -> usize {
 /// Bytes of genome in the genome ocean each epoch: about half a typical population.
 const GENOME_OCEAN: usize = 1 << 16;
 
+fn on_all(predation: bool, ops: &mut Vec<u8>) {
+    if predation {
+        ops.push(EAT);
+    }
+}
+
 /// The ops mutation can produce and creatures can run: the Tierra core, plus each switched-on
 /// feature's own ops. Without `lean`, all of them.
 pub fn alphabet(p: &Params, has_ocean: bool) -> Vec<u8> {
     if !p.lean {
-        return (0..NUM_OPS).collect();
+        // Every op from before predation existed, so old runs keep their alphabet.
+        let mut all: Vec<u8> = (0..=JOIN).collect();
+        on_all(p.predation, &mut all);
+        return all;
     }
     let mut ops: Vec<u8> = (0..=SENSE).chain([NOPX]).collect();
     let on = |f: bool, xs: &[u8], ops: &mut Vec<u8>| if f { ops.extend_from_slice(xs) };
@@ -143,6 +166,7 @@ pub fn alphabet(p: &Params, has_ocean: bool) -> Vec<u8> {
     on(p.regime == Regime::Evolved, &[ENCLOSE, LEVY, REVOLT], &mut ops);
     on(p.social, &[MATE, LEARN, TEACH, JOIN], &mut ops);
     on(p.social && p.energy, &[GIVE], &mut ops);
+    on(p.predation && p.energy, &[EAT], &mut ops);
     ops
 }
 
@@ -181,6 +205,11 @@ impl Default for Params {
             hgt: false,
             free_copy: false,
             birth_cost: 0,
+            predation: false,
+            local: false,
+            sex: false,
+            reap_poor: false,
+            radius: 1024,
         }
     }
 }
@@ -265,6 +294,8 @@ pub struct Creature {
     prev2: u8,
     /// Unpaid ocean score (zero or negative), carried across cycles and to children.
     debt: i32,
+    /// Has eaten this cycle (predation allows one kill per cycle).
+    ate: bool,
     /// Diving the local reef instead of the ocean, where in it, and what emitting has earned.
     reef_mode: bool,
     reef_pos: u64,
@@ -439,6 +470,7 @@ pub struct Stats {
     pub died_old: u64,
     pub died_starved: u64,
     pub died_reaped: u64,
+    pub died_eaten: u64,
 }
 
 pub fn genotype_of(code: &[u8]) -> u64 {
@@ -1701,6 +1733,13 @@ impl World {
                     self.error(c, slot);
                 }
             }
+            EAT => {
+                let (bits, len) = self.template(p + 1);
+                next = p.wrapping_add(1 + len);
+                if !self.p.predation || !self.eat(c, slot, bits, len) {
+                    self.error(c, slot);
+                }
+            }
             GUESS => {
                 c.guess = c.cx as u8;
                 c.has_guess = true;
@@ -1800,6 +1839,10 @@ impl World {
         c.child_writes = 0;
         c.child_seen = [0; 8];
         let need = size + self.slack();
+        if self.p.local {
+            self.mal_local(c, slot, size, need);
+            return;
+        }
         let limit = (self.p.fill * self.n as f64) as u64;
         while self.used + need as u64 > limit {
             if !self.reap_one(slot) {
@@ -1872,7 +1915,11 @@ impl World {
         self.release(s, z + self.slack());
         let resized = z != c.size;
         let (z, indels) = self.indel(s, z);
-        if let Some((ps, pid)) = c.mate.take() {
+        let mate = match c.mate.take() {
+            None if self.p.sex => self.mate_near(s, z, slot),
+            m => m,
+        };
+        if let Some((ps, pid)) = mate {
             self.crossover(s, z, ps as usize, pid);
         }
         let g = genotype_of(&self.soup[s as usize..(s + z) as usize]);
@@ -1986,6 +2033,7 @@ impl World {
         c.tasks_last = c.tasks_now;
         c.tasks_now = 0;
         c.infected = false;
+        c.ate = false;
         c.hits_last = c.hits;
         c.scored_last = c.scored;
         c.hits = 0;
@@ -2082,6 +2130,117 @@ impl World {
     /// The Red Queen. A creature can take half the CPU share of a neighbour that does a
     /// logic task it also does, once per cycle. Common ways of making a living get
     /// hunted, so rare and new ones pay. ECHO doesn't count: everyone can do it.
+    /// Ring distance between two cells.
+    fn ring_dist(&self, a: u32, b: u32) -> u32 {
+        let d = a.wrapping_sub(b) & self.mask;
+        d.min(self.n - d)
+    }
+
+    /// Living creatures other than `skip` with a body cell within `r` cells of `centre`, in
+    /// scan order from `centre - r`. Free space is skipped a word at a time and each body
+    /// in one step.
+    fn neighbours(&self, centre: u32, r: u32, skip: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let span = (2 * r as u64 + 1).min(self.n as u64) as u32;
+        let (mut a, mut k) = (centre.wrapping_sub(r) & self.mask, 0u32);
+        while k < span {
+            let free = self.occ[(a / 64) as usize] >> (a % 64);
+            let step = if free & 1 == 0 {
+                if free == 0 { 64 - a % 64 } else { free.trailing_zeros() }
+            } else {
+                let o = self.owner[a as usize] as usize;
+                if o == 0 {
+                    1
+                } else {
+                    let d = &self.cs[o - 1];
+                    let off = a.wrapping_sub(d.start);
+                    if d.alive && off < d.size {
+                        if o - 1 != skip && !out.contains(&(o - 1)) {
+                            out.push(o - 1);
+                        }
+                        d.size - off
+                    } else {
+                        1
+                    }
+                }
+            };
+            k += step;
+            a = (a + step) & self.mask;
+        }
+        out
+    }
+
+    /// v5 birth: a free spot within `radius` of the mother's target, reaping neighbours of
+    /// the target (poorest or oldest) for room, up to eight times.
+    fn mal_local(&mut self, c: &mut Creature, slot: usize, size: u32, need: u32) {
+        let r = self.p.radius;
+        let target = (c.start as i64 + (c.dx as i32 as i64) * 16).rem_euclid(self.n as i64) as u32;
+        for _ in 0..8 {
+            if let Some(a) = self.find_free(target.wrapping_sub(r) & self.mask, need, 2 * r) {
+                self.claim(a, need, slot);
+                self.used += need as u64;
+                c.child = Some((a, size));
+                c.ax = a;
+                return;
+            }
+            let ns = self.neighbours(target, r, slot);
+            let key = |v: usize| {
+                let d = &self.cs[v];
+                (if self.p.reap_poor { d.energy } else { 0 }, d.reap_score, d.id)
+            };
+            match ns.into_iter().min_by_key(|&v| key(v)) {
+                Some(v) => {
+                    self.stats.died_reaped += 1;
+                    self.kill(v);
+                }
+                None => break,
+            }
+        }
+        self.error(c, slot);
+    }
+
+    /// The nearest creature to the child block within `radius` whose size is within an
+    /// eighth of the child's: the mate for an obligatory crossover.
+    fn mate_near(&self, s: u32, z: u32, slot: usize) -> Option<(u32, u64)> {
+        let mid = s + z / 2;
+        self.neighbours(mid, self.p.radius, slot)
+            .into_iter()
+            .filter(|&v| self.cs[v].size.abs_diff(z) <= z / 8)
+            .min_by_key(|&v| self.ring_dist(self.cs[v].start, mid))
+            .map(|v| (v as u32, self.cs[v].id))
+    }
+
+    /// Predation. The prey is the creature whose body holds ax, or the next one ahead
+    /// within `radius`; the key's complement must lie in its first SURFACE cells. The prey
+    /// dies and its whole balance moves to the predator.
+    fn eat(&mut self, c: &mut Creature, slot: usize, bits: u32, len: u32) -> bool {
+        if !self.p.energy || c.ate || len == 0 {
+            return false;
+        }
+        let r = self.p.radius;
+        let a = c.ax & self.mask;
+        let Some(v) = self.neighbours(a.wrapping_add(r / 2), r / 2, slot).into_iter().find(|&v| {
+            let d = &self.cs[v];
+            a.wrapping_sub(d.start) & self.mask < d.size || d.start.wrapping_sub(a) & self.mask <= r / 2
+        }) else {
+            return false;
+        };
+        let (vs, vz) = (self.cs[v].start, self.cs[v].size);
+        if self.ring_dist(vs, c.start) > r {
+            return false;
+        }
+        let surf = vz.min(SURFACE);
+        if surf < len || !(vs..=vs + surf - len).any(|q| self.matches(q, bits, len)) {
+            return false;
+        }
+        let e = std::mem::take(&mut self.cs[v].energy);
+        c.energy += e;
+        self.stats.died_eaten += 1;
+        self.kill(v);
+        c.ate = true;
+        true
+    }
+
     fn infect(&mut self, c: &mut Creature, slot: usize, bits: u32, len: u32) -> bool {
         if c.infected {
             return false;
@@ -2230,6 +2389,9 @@ impl World {
             }
             if self.p.debt {
                 h.update(&c.debt.to_le_bytes());
+            }
+            if self.p.predation {
+                h.update(&[c.ate as u8]);
             }
         }
         *blake3::hash(&h.0).as_bytes()

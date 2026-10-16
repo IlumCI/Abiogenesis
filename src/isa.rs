@@ -52,14 +52,15 @@ pub const MATE: u8 = 47;
 pub const LEARN: u8 = 48;
 pub const TEACH: u8 = 49;
 pub const JOIN: u8 = 50;
+pub const EAT: u8 = 51;
 
-pub const NUM_OPS: u8 = 51;
+pub const NUM_OPS: u8 = 52;
 
 pub const NAMES: [&str; NUM_OPS as usize] = [
     "nop0", "nop1", "or1", "shl", "zero", "if_cz", "sub_ab", "sub_ac", "inc_a", "inc_b", "dec_c",
     "inc_c", "push_ax", "push_bx", "push_cx", "push_dx", "pop_ax", "pop_bx", "pop_cx", "pop_dx",
     "jmp", "jmpb", "call", "ret", "mov_cd", "mov_ab", "mov_iab", "adr", "adrb", "adrf", "mal",
-    "divide", "sense", "nopx", "nand", "io", "dive", "guess", "load", "store", "infect", "emit", "tune", "enclose", "levy", "revolt", "give", "mate", "learn", "teach", "join",
+    "divide", "sense", "nopx", "nand", "io", "dive", "guess", "load", "store", "infect", "emit", "tune", "enclose", "levy", "revolt", "give", "mate", "learn", "teach", "join", "eat",
 ];
 
 /// Avida's nine logic tasks (Lenski et al. 2003), cheapest first, then echo: output a
