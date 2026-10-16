@@ -94,6 +94,18 @@ to Linux.
     learner averages are +0.14 to +0.28, well under the +0.62 reachable offline.
   - The 3,000-epoch screen had said 9/10 on genotypes. Short screens overrate early
     bursts.
+- **Experiment 5, frequency-dependent streams** (`--streams 64` on the memory arm, 10 ×
+  20k, control = experiment 4's memory arm): **FAIL**, 0/10 on both verdicts. Not a fair
+  test, because of the cheat below.
+- **Fifth cheat: the ocean lottery.** Each cycle's ocean score was floored at 0 and then
+  reset, so a guesser worse than a constant guess still collected its lucky cycles.
+  - Under streams, about 2,000 creatures per world guessed across all 64 streams at
+    −0.16 bits/guess on average, and persisted.
+  - The memory arm alone had real skill (+0.23).
+  - **Fix (`debt`, part of `--v4` since 2026-10-16):** a negative net is carried, and
+    inherited, until it's paid back. Older v4 runs have no `debt` key and replay
+    unchanged.
+  - Experiments 4 and 5 were rerun with it as `L9_m2` and `L9_f`.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):
   1. ~~Baseline v4~~ (done).
   2. Fast screening: small and short, then confirm long.
@@ -139,7 +151,7 @@ Cost: 30 runs × 20,000 epochs.
 |---|---|
 | `run --epochs 100 --seed 1 --no-tasks --economy energy --ocean oceans/enwik8` | `192577de66da806e08b2b113f4d51d6c4dd9a7c127eb486597016ecced0edf65` |
 | the same plus `--all-ops --reef` (the pre-lean engine) | `6c829caf0c65f879bccda078046f229e3d4bd7f6cd8e9162699458f02ba6c430` |
-| the first command plus `--v4` | `40000b8d06992fff2454e89ad58a16eb2f9dc79417a6538716b08595f91491f3` |
+| the first command plus `--v4` (with debt) | `2d40ede8750f355341d0cdab57d5d7543192b5730cc0e3b9eddfbbdc980a8475` |
 
 The simulation uses only integer and basic float math, so they should match. If they don't,
 find out why before trusting any comparison with Windows-era results.
@@ -185,7 +197,8 @@ find out why before trusting any comparison with Windows-era results.
   - copying the first half twice.
 
   Lean mode now requires every distinct cell copied from the mother's own body
-  (`child_seen` in `src/world.rs`). Expect a fifth variant, and suspect one whenever the
+  (`child_seen` in `src/world.rs`). The fifth was in scoring, not copying: the ocean
+  lottery (see Where things stand). Expect a sixth, and suspect one whenever the
   diversity/population ratio climbs toward 1.
 - **Earlier extinctions and their fixes:**
 

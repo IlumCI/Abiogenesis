@@ -54,10 +54,10 @@ impl Config {
     fn to_text(&self) -> String {
         let p = &self.p;
         format!(
-            "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nstreams={}\nops={}\n",
+            "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nstreams={}\ndebt={}\nops={}\n",
             self.seed, self.epochs, self.epoch_instr, self.warmup, self.feed, p.soup_bits, p.copy_error,
             p.cosmic_base, p.fill, p.min_size, p.max_size, p.search_limit, p.sun_bonus, p.tasks as u8, p.indel, p.max_merit, p.max_age, self.ocean, ocean_hash(&self.ocean), p.ocean_div, p.ocean_cap, p.memory as u8, p.infect as u8, p.infect_radius, p.reef as u8, self.migrate_every, self.migrate_count, p.energy as u8, p.energy_total, match p.regime { world::Regime::Commons => 0, world::Regime::Feudal => 1, world::Regime::Capitalist => 2, world::Regime::Evolved => 3 },
-            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams,
+            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams, p.debt as u8,
             world::alphabet(p, !self.ocean.is_empty()).iter().map(|&o| isa::NAMES[o as usize]).collect::<Vec<_>>().join(" ")
         )
     }
@@ -106,6 +106,7 @@ impl Config {
                 v4: num("v4").map(|v| v != 0).unwrap_or(false),
                 mem2: num("mem2").map(|v| v != 0).unwrap_or(false),
                 streams: num("streams").unwrap_or(0) as u32,
+                debt: num("debt").map(|v| v != 0).unwrap_or(false),
             },
         })
     }
@@ -452,6 +453,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
     p.genome_ocean = arg_val(args, "--ocean") == Some("genomes");
     p.learned_mut = num("--learned-mut", 0)?.min(100) as u32;
     p.v4 = args.iter().any(|a| a == "--v4");
+    p.debt = p.v4;
     p.mem2 = args.iter().any(|a| a == "--mem2");
     p.energy_total = num("--energy-total", p.energy_total)?;
     p.streams = num("--streams", 0)?.min(256) as u32;

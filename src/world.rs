@@ -99,6 +99,10 @@ pub struct Params {
     /// epoch, so a crowded stream pays little and an empty one a lot. One child in 16
     /// moves to a random stream. 0 = off.
     pub streams: u32,
+    /// v4 debt: a cycle's net ocean score below zero is carried (and inherited) instead of
+    /// floored, so guessing worse than a constant guess can't pay off as a lottery on its
+    /// lucky cycles. Part of `--v4` since 2026-10-16; older v4 runs have it off.
+    pub debt: bool,
 }
 
 /// Size of the order-2 memory, and where a two-byte context lands in it.
@@ -161,6 +165,7 @@ impl Default for Params {
             v4: false,
             mem2: false,
             streams: 0,
+            debt: false,
         }
     }
 }
@@ -238,6 +243,8 @@ pub struct Creature {
     /// The last byte this lineage read from the ocean, and the one before (order-2 memory).
     prev: u8,
     prev2: u8,
+    /// Unpaid ocean score (zero or negative), carried across cycles and to children.
+    debt: i32,
     /// Diving the local reef instead of the ocean, where in it, and what emitting has earned.
     reef_mode: bool,
     reef_pos: u64,
@@ -1742,7 +1749,14 @@ impl World {
         } else {
             0
         };
-        let earned = c.bits.max(0) as u64 + task_pts;
+        let ocean = if self.p.debt {
+            let net = c.bits.saturating_add(c.debt);
+            c.debt = net.min(0);
+            net.max(0)
+        } else {
+            c.bits.max(0)
+        };
+        let earned = ocean as u64 + task_pts;
         if self.p.v4 && self.p.energy {
             let rate = match self.stream_of(c.pos) {
                 Some(k) => {
@@ -1780,6 +1794,7 @@ impl World {
         ch.mem = c.mem.clone();
         ch.prev = c.prev;
         ch.prev2 = c.prev2;
+        ch.debt = c.debt;
         ch.reef_mode = c.reef_mode;
         self.events.push(Event::Birth {
             mother: c.genotype,
@@ -2036,6 +2051,9 @@ impl World {
             h.update(&c.mem);
             if self.p.mem2 {
                 h.update(&[c.prev2]);
+            }
+            if self.p.debt {
+                h.update(&c.debt.to_le_bytes());
             }
         }
         *blake3::hash(&h.0).as_bytes()
