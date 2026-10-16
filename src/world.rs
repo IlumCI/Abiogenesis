@@ -252,6 +252,11 @@ pub struct Creature {
     #[serde(skip)]
     cache: Option<JumpTable>,
     dirty: bool,
+    /// Once dirty, the creature's own jump table, valid until its body next changes.
+    #[serde(skip)]
+    pcache: Vec<u32>,
+    #[serde(skip)]
+    pcache_ok: bool,
     /// Private memory, 256 bytes once in use. Children start with a copy of their
     /// mother's, so what one generation learns the next begins with.
     pub mem: Vec<u8>,
@@ -310,7 +315,8 @@ struct Reef {
     written: u64,
 }
 
-/// Offset of each jump's landing spot within the genome, UNKNOWN until first worked out.
+/// Offset of each jump's landing spot within the genome, with the template's length in the
+/// top byte; UNKNOWN until first worked out.
 type JumpTable = Rc<RefCell<Vec<u32>>>;
 const UNKNOWN: u32 = u32::MAX;
 
@@ -341,6 +347,13 @@ pub struct World {
     /// What mutation draws from, and the same set as a bitmask for execution.
     ops: Vec<u8>,
     enabled: u64,
+    /// The same as `enabled`, one flag per byte value, for the per-step check.
+    #[serde(skip)]
+    op_ok: Vec<bool>,
+    /// SIMD finders for every template complement, forward and backward, indexed by
+    /// `finder_index`. Rebuilt after loading.
+    #[serde(skip)]
+    finders: Vec<(memchr::memmem::Finder<'static>, memchr::memmem::FinderRev<'static>)>,
     pub n: u32,
     mask: u32,
     pub soup: Vec<u8>,
@@ -444,6 +457,8 @@ impl World {
         World {
             ops,
             enabled,
+            op_ok: Vec::new(),
+            finders: Vec::new(),
             n,
             mask: n - 1,
             soup,
@@ -524,17 +539,34 @@ impl World {
 
     fn with_base_guess(mut self) -> Self {
         self.set_base_guess();
+        self.build_tables();
         self
+    }
+
+    /// Lookup tables derived from the parameters, rebuilt rather than saved.
+    fn build_tables(&mut self) {
+        self.op_ok = (0..256u32).map(|op| op < 64 && self.enabled & 1 << op != 0).collect();
+        self.finders = (1..=MAX_TEMPLATE)
+            .flat_map(|len| (0..1u32 << len).map(move |bits| (len, bits)))
+            .map(|(len, bits)| {
+                let pat: Vec<u8> = (0..len).map(|i| (((bits >> i) & 1) ^ 1) as u8).collect();
+                (memchr::memmem::Finder::new(&pat).into_owned(), memchr::memmem::FinderRev::new(&pat).into_owned())
+            })
+            .collect();
     }
 
     fn set_base_guess(&mut self) {
         if !self.p.v4 || self.ocean.is_empty() {
             return;
         }
-        let mut ones = [0u64; 8];
+        let mut hist = [0u64; 256];
         for &b in &self.ocean {
+            hist[b as usize] += 1;
+        }
+        let mut ones = [0u64; 8];
+        for (v, &n) in hist.iter().enumerate() {
             for (k, o) in ones.iter_mut().enumerate() {
-                *o += (b >> k & 1) as u64;
+                *o += (v >> k & 1) as u64 * n;
             }
         }
         let n = self.ocean.len() as u64;
@@ -601,6 +633,7 @@ impl World {
     pub fn after_load(&mut self, ocean: Vec<u8>) {
         self.ocean = ocean;
         self.set_base_guess();
+        self.build_tables();
         for i in 0..self.cs.len() {
             if !self.cs[i].alive {
                 continue;
@@ -1088,18 +1121,31 @@ impl World {
     }
 
     fn claim(&mut self, start: u32, size: u32, slot: usize) {
-        for a in start..start + size {
-            self.owner[a as usize] = slot as u32 + 1;
-            self.occ[(a / 64) as usize] |= 1 << (a % 64);
-        }
+        self.owner[start as usize..(start + size) as usize].fill(slot as u32 + 1);
+        self.mark_occ(start, size, true);
     }
 
     fn release(&mut self, start: u32, size: u32) {
-        for a in start..start + size {
-            self.owner[a as usize] = 0;
-            self.occ[(a / 64) as usize] &= !(1u64 << (a % 64));
-        }
+        self.owner[start as usize..(start + size) as usize].fill(0);
+        self.mark_occ(start, size, false);
         self.used -= size as u64;
+    }
+
+    /// Set or clear the occupancy bits of cells `start..start + size`, a word at a time.
+    fn mark_occ(&mut self, start: u32, size: u32, on: bool) {
+        let (mut a, end) = (start, start + size);
+        while a < end {
+            let bit = a % 64;
+            let n = (64 - bit).min(end - a);
+            let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << bit };
+            let w = &mut self.occ[(a / 64) as usize];
+            if on {
+                *w |= m;
+            } else {
+                *w &= !m;
+            }
+            a += n;
+        }
     }
 
     /// Free cells and scramble them: dead bodies decay. Without this, whole populations
@@ -1150,8 +1196,11 @@ impl World {
 
     fn decay(&mut self, start: u32, size: u32) {
         self.release(start, size);
-        for a in start..start + size {
-            self.soup[a as usize] = self.random_op();
+        // The same draws as one `random_op` per cell, in order.
+        let (rng, ops) = (&mut self.rng, &self.ops);
+        let n = ops.len() as u64;
+        for cell in &mut self.soup[start as usize..(start + size) as usize] {
+            *cell = ops[rng.below(n) as usize];
         }
     }
 
@@ -1312,8 +1361,16 @@ impl World {
             }
             idle_run = 0;
             c.idle = 0;
+            // Errors lower the reaper key; the queue entry is moved once, after the turn.
+            // Nothing reads the runner's place in the queue meanwhile: `reap_one(slot)` spares
+            // it, and it can't be killed during its own turn.
+            let key = c.reap_score;
             for _ in 0..slice {
                 self.step(&mut c, slot);
+            }
+            if c.reap_score != key {
+                self.reaper.remove(&(key, c.id, slot));
+                self.reaper.insert((c.reap_score, c.id, slot));
             }
             c.age += slice;
             let old = self.p.max_age > 0 && c.age > self.p.max_age * c.size as u64;
@@ -1326,11 +1383,10 @@ impl World {
         }
     }
 
-    fn error(&mut self, c: &mut Creature, slot: usize) {
+    /// Only ever called on the creature whose turn it is; `run` re-files its reaper key.
+    fn error(&mut self, c: &mut Creature, _slot: usize) {
         c.errors += 1;
-        self.reaper.remove(&(c.reap_score, c.id, slot));
         c.reap_score -= ERROR_WEIGHT;
-        self.reaper.insert((c.reap_score, c.id, slot));
     }
 
     fn cosmic_ray(&mut self, c: &mut Creature, slot: usize) {
@@ -1340,8 +1396,15 @@ impl World {
         // creature is out of `cs` while it runs, so it is marked directly.
         match self.owner[a] {
             0 => {}
-            o if o as usize - 1 == slot => c.dirty = true,
-            o => self.cs[o as usize - 1].dirty = true,
+            o if o as usize - 1 == slot => {
+                c.dirty = true;
+                c.pcache_ok = false;
+            }
+            o => {
+                let v = &mut self.cs[o as usize - 1];
+                v.dirty = true;
+                v.pcache_ok = false;
+            }
         }
         let iv = self.weather.cosmic_interval.max(1);
         self.next_cosmic = self.instr + 1 + self.rng.below(2 * iv);
@@ -1372,46 +1435,83 @@ impl World {
 
     /// Find the complement of a template. Returns the address just past it.
     /// `fwd_from` is where a forward search starts, `back_from` is the instruction itself.
-    /// Also returns how many steps out it looked before finding the match.
+    /// Also returns how many steps out it looked before finding the match. Looking k steps
+    /// out tries forward before backward, so the nearer match wins and forward wins ties.
     fn search(&self, bits: u32, len: u32, fwd_from: u32, back_from: u32, fwd: bool, back: bool) -> Option<(u32, u32)> {
-        for k in 0..self.p.search_limit {
-            if fwd {
-                let q = fwd_from.wrapping_add(k);
-                if self.matches(q, bits, len) {
-                    return Some(((q + len) & self.mask, k));
-                }
-            }
-            if back {
-                let q = back_from.wrapping_sub(len + k);
-                if self.matches(q, bits, len) {
-                    return Some(((q.wrapping_add(len)) & self.mask, k));
-                }
-            }
+        let limit = self.p.search_limit;
+        let (finder, rfinder) = &self.finders[((1u32 << len) - 2 + bits) as usize];
+        let kf = if fwd { self.search_fwd(finder, bits, len, fwd_from & self.mask, limit) } else { None };
+        let kb = if back { self.search_back(rfinder, bits, len, back_from, kf.unwrap_or(limit)) } else { None };
+        match (kf, kb) {
+            (_, Some(k)) if kf.is_none_or(|f| k < f) => Some((back_from.wrapping_sub(k) & self.mask, k)),
+            (Some(k), _) => Some(((fwd_from.wrapping_add(k) + len) & self.mask, k)),
+            _ => None,
         }
-        None
     }
 
-    /// `search`, remembered per genotype. An answer is stored only if every cell the
-    /// search looked at lies inside the creature's own body: then it depends on the
-    /// genome alone and every sibling with an unchanged body gets the same answer.
-    fn search_cached(&self, c: &Creature, p: u32, bits: u32, len: u32, fwd_from: u32, fwd: bool, back: bool) -> Option<u32> {
-        let off = p.wrapping_sub(c.start);
-        let table = match &c.cache {
-            Some(t) if !c.dirty && off < c.size => t,
-            _ => return self.search(bits, len, fwd_from, p, fwd, back).map(|r| r.0),
-        };
-        let known = table.borrow()[off as usize];
-        if known != UNKNOWN {
-            return Some((c.start + known) & self.mask);
+    /// The first k < limit with the complement at `start + k`.
+    fn search_fwd(&self, f: &memchr::memmem::Finder, bits: u32, len: u32, start: u32, limit: u32) -> Option<u32> {
+        let end = start as usize + (limit + len - 1) as usize;
+        if limit > 0 && end <= self.soup.len() {
+            return f.find(&self.soup[start as usize..end]).map(|k| k as u32);
         }
+        (0..limit).find(|&k| self.matches(start.wrapping_add(k), bits, len))
+    }
+
+    /// The first k < limit with the complement ending just before `back_from - k`.
+    fn search_back(&self, f: &memchr::memmem::FinderRev, bits: u32, len: u32, back_from: u32, limit: u32) -> Option<u32> {
+        if limit == 0 {
+            return None;
+        }
+        let top = back_from as i64 - len as i64;
+        let low = top - (limit as i64 - 1);
+        if low >= 0 && back_from as usize <= self.soup.len() {
+            return f.rfind(&self.soup[low as usize..back_from as usize]).map(|r| (top - (low + r as i64)) as u32);
+        }
+        (0..limit).find(|&k| self.matches(back_from.wrapping_sub(len + k), bits, len))
+    }
+
+    /// A remembered jump from the instruction at `p`: where it lands and its template's
+    /// length. Clean creatures share their genotype's table; dirty ones keep their own.
+    fn cached_jump(&self, c: &mut Creature, p: u32) -> Option<(u32, u32)> {
+        let off = p.wrapping_sub(c.start);
+        if off >= c.size {
+            return None;
+        }
+        let e = if c.dirty {
+            if !c.pcache_ok {
+                return None;
+            }
+            c.pcache[off as usize]
+        } else {
+            c.cache.as_ref()?.borrow()[off as usize]
+        };
+        (e != UNKNOWN).then(|| ((c.start + (e & 0xFF_FFFF)) & self.mask, e >> 24))
+    }
+
+    /// `search`, remembered. An answer is stored only if every cell the search looked at
+    /// (the template and the cell that ended it included) lies inside the creature's own
+    /// body: then it depends on the body alone, which for a clean creature is its genome,
+    /// and a dirty one's own table is wiped whenever its body changes.
+    fn search_cached(&self, c: &mut Creature, p: u32, bits: u32, len: u32, fwd_from: u32, fwd: bool, back: bool) -> Option<u32> {
         let found = self.search(bits, len, fwd_from, p, fwd, back);
-        if let Some((a, k)) = found {
+        let off = p.wrapping_sub(c.start);
+        if let Some((a, k)) = found.filter(|_| off < c.size) {
             let (lo, hi) = (c.start as i64, (c.start + c.size) as i64);
             let low = if back { p as i64 - len as i64 - k as i64 } else { fwd_from as i64 };
-            // The template itself, and the cell that ended it, count as looked at too.
             let high = if fwd { fwd_from as i64 + k as i64 + len as i64 } else { p as i64 }.max(fwd_from as i64 + 1);
             if low >= lo && high <= hi {
-                table.borrow_mut()[off as usize] = (a as i64 - lo) as u32;
+                let e = (a as i64 - lo) as u32 | len << 24;
+                if c.dirty {
+                    if !c.pcache_ok {
+                        c.pcache.clear();
+                        c.pcache.resize(c.size as usize, UNKNOWN);
+                        c.pcache_ok = true;
+                    }
+                    c.pcache[off as usize] = e;
+                } else if let Some(t) = &c.cache {
+                    t.borrow_mut()[off as usize] = e;
+                }
             }
         }
         found.map(|r| r.0)
@@ -1424,15 +1524,16 @@ impl World {
         if self.instr >= self.next_cosmic {
             self.cosmic_ray(c, slot);
         }
-        if !c.owns(p) {
+        let off = p.wrapping_sub(c.start);
+        if off < c.size {
+            if off < 512 {
+                c.ran[off as usize / 64] |= 1 << (off % 64);
+            }
+        } else if !matches!(c.child, Some((s, z)) if p.wrapping_sub(s) < z) {
             c.ran_foreign = true;
         }
-        let off = p.wrapping_sub(c.start);
-        if off < c.size.min(512) {
-            c.ran[off as usize / 64] |= 1 << (off % 64);
-        }
         let mut next = p.wrapping_add(1);
-        if op >= 64 || self.enabled & 1 << op == 0 {
+        if !self.op_ok[op as usize] {
             self.error(c, slot);
             c.ip = next & self.mask;
             return;
@@ -1479,17 +1580,24 @@ impl World {
                 }
             }
             JMP | JMPB | CALL | ADR | ADRB | ADRF => {
-                let (bits, len) = self.template(p + 1);
+                let (target, len) = match self.cached_jump(c, p) {
+                    Some((a, len)) => (Some(a), len),
+                    None => {
+                        let (bits, len) = self.template(p + 1);
+                        let (f, b) = match op {
+                            JMPB | ADRB => (false, true),
+                            ADRF => (true, false),
+                            _ => (true, true),
+                        };
+                        let from = p.wrapping_add(1 + len);
+                        (if len == 0 { None } else { prof::time(prof::SEARCH, || self.search_cached(c, p, bits, len, from, f, b)) }, len)
+                    }
+                };
                 next = p.wrapping_add(1 + len);
                 if len == 0 {
                     self.error(c, slot);
                 } else {
-                    let (f, b) = match op {
-                        JMPB | ADRB => (false, true),
-                        ADRF => (true, false),
-                        _ => (true, true),
-                    };
-                    match prof::time(prof::SEARCH, || self.search_cached(c, p, bits, len, next, f, b)) {
+                    match target {
                         None => self.error(c, slot),
                         Some(a) => match op {
                             JMP | JMPB => next = a,
@@ -1537,6 +1645,7 @@ impl World {
                         }
                     } else {
                         c.dirty = true;
+                        c.pcache_ok = false;
                     }
                 } else {
                     self.error(c, slot);
@@ -2103,6 +2212,53 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The template search as it was: one step out at a time, forward then backward.
+    fn search_scan(w: &World, bits: u32, len: u32, fwd_from: u32, back_from: u32, fwd: bool, back: bool) -> Option<(u32, u32)> {
+        for k in 0..w.p.search_limit {
+            if fwd {
+                let q = fwd_from.wrapping_add(k);
+                if w.matches(q, bits, len) {
+                    return Some(((q + len) & w.mask, k));
+                }
+            }
+            if back {
+                let q = back_from.wrapping_sub(len + k);
+                if w.matches(q, bits, len) {
+                    return Some(((q.wrapping_add(len)) & w.mask, k));
+                }
+            }
+        }
+        None
+    }
+
+    /// The SIMD template search must give exactly the scan's answer, wrap-around included.
+    #[test]
+    fn search_matches_scan() {
+        let mut rng = Rng::new(11);
+        for round in 0..300 {
+            let limit = [0, 1, 7, 64, 1024][rng.below(5) as usize];
+            let p = Params { soup_bits: 10, search_limit: limit, ..Default::default() };
+            let mut w = World::new(p, round, Vec::new());
+            // Mostly nops, so matches are common, sometimes rare.
+            let nops = 20 + rng.below(80);
+            for c in w.soup.iter_mut() {
+                *c = if rng.below(100) < nops { rng.below(2) as u8 } else { 2 + rng.below(30) as u8 };
+            }
+            for _ in 0..200 {
+                let len = 1 + rng.below(MAX_TEMPLATE as u64) as u32;
+                let bits = rng.below(1 << len) as u32;
+                let p = rng.below(w.n as u64) as u32;
+                let fwd_from = p + 1 + len;
+                let (fwd, back) = [(true, true), (false, true), (true, false)][rng.below(3) as usize];
+                assert_eq!(
+                    w.search(bits, len, fwd_from, p, fwd, back),
+                    search_scan(&w, bits, len, fwd_from, p, fwd, back),
+                    "round {round} p {p} len {len} bits {bits} limit {limit} fwd {fwd} back {back}"
+                );
+            }
+        }
+    }
 
     /// The word-at-a-time free-space search must give exactly the scan's answer.
     #[test]
