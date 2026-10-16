@@ -81,6 +81,17 @@ to Linux.
   - **At 4M,** half the CPU goes idle and the learner is lost.
   - Three-seed screens are too noisy: an arm with no divers at all "beat" the control 3/3.
     Screen with 10 seeds.
+- **Experiment 4, order-2 memory** (`--mem2` vs v4, both at `--energy-total 8000000`, 10 ×
+  20k): **FAIL**, 3/10 pairs on genes (official) and 3/10 on genotypes.
+  - **Bigger burst, same decay.** The memory arm makes about 2× the control's new genes in
+    the first half (often 20–35k against 7–16k), then falls off just like it: the second
+    half is below half the first in 3 of 10 pairs. The plateau moved up; it didn't go away.
+  - **The learner evolved and lasted in 4 of 10 worlds** (about 1,900–2,400 divers at the
+    end), and in 1 of 10 controls.
+  - **Seed 3 reached +1.31 bits/guess.** That's above anything order-2 can reach offline
+    (+0.74 in-sample), so suspect a fifth cheat (Lessons) until it's explained.
+  - The 3,000-epoch screen had said 9/10 on genotypes. Short screens overrate early
+    bursts.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):
   1. ~~Baseline v4~~ (done).
   2. Fast screening: small and short, then confirm long.
