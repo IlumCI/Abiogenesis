@@ -55,11 +55,32 @@ to Linux.
   - Score is paid in energy at divide from the pool, priced each epoch so last epoch's
     score would use half the budget, and never more than one creature's share per unit.
   - The founder starts at a random ocean offset.
+  - An empty memory reads as that constant guess, not 0x00. Offline, a young order-2
+    learner (1,000 bytes seen) earns +0.48 bits/guess this way, against +0.07.
   - Ocean: enwik8. Under v4 scoring, its order-1 learner breaks even (−0.006) where prose
     loses (−0.16), and order-2 pays +0.67, so the path to a better learner has no valley.
   - **Result:** in 3 × 3,000-epoch screens almost no creature guesses (0–25 divers, against
     about 1,000 on the old engine). The old ocean reward was the free bits. Novelty is level
     with the old engine (1/3 pairs either way), and populations are similar.
+- **Order-2 memory** (`--mem2`). `dive` leaves two-byte contexts in dx and cx, and memory is
+  4 KB, indexed by a hash of them. The 4-op learner (`store load guess dive`) becomes an
+  order-2 learner. Offline it reaches +0.62 bits/guess on enwik8; a full 64 KB table
+  reaches +0.67.
+  - The learner never evolves from scratch: under v4 nothing pays until all four ops are
+    in place. `ancestors/learner.tasm` seeds it, with 10 copies in place of the 40
+    `nopx`.
+- **Energy never bound** (found 2026-10-16). At the default `energy_total` of 64M, the
+  payout is about 27M per epoch, against 2M instructions that can run. Nobody is ever
+  broke, and every death is space reaping, so income acts only through relative
+  wealth → speed.
+  - **At 64M,** selection discards a seeded learner that pays: divers fall from about
+    1,000 to 0 by epoch 2,500, and size shrinks from 124 to 60–90.
+  - **At `--energy-total 8000000`,** the learner persists (about 1,350 of 1,500 still diving
+    at epoch 3,000). It does not improve, though: it stays at 0 to +0.3 bits/guess. Births
+    fall from 2–3k to about 1.4k per epoch, and gene novelty falls about 10×.
+  - **At 4M,** half the CPU goes idle and the learner is lost.
+  - Three-seed screens are too noisy: an arm with no divers at all "beat" the control 3/3.
+    Screen with 10 seeds.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):
   1. ~~Baseline v4~~ (done).
   2. Fast screening: small and short, then confirm long.
@@ -105,7 +126,7 @@ Cost: 30 runs × 20,000 epochs.
 |---|---|
 | `run --epochs 100 --seed 1 --no-tasks --economy energy --ocean oceans/enwik8` | `192577de66da806e08b2b113f4d51d6c4dd9a7c127eb486597016ecced0edf65` |
 | the same plus `--all-ops --reef` (the pre-lean engine) | `6c829caf0c65f879bccda078046f229e3d4bd7f6cd8e9162699458f02ba6c430` |
-| the first command plus `--v4` | `553537383139090037e4634376cd166b5969706f9207310e667ac4b5742280c9` |
+| the first command plus `--v4` | `40000b8d06992fff2454e89ad58a16eb2f9dc79417a6538716b08595f91491f3` |
 
 The simulation uses only integer and basic float math, so they should match. If they don't,
 find out why before trusting any comparison with Windows-era results.

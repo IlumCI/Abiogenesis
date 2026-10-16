@@ -90,6 +90,16 @@ pub struct Params {
     /// guess, the score is paid in energy at divide (none lost if the mother dies before the
     /// payout), and the founder starts at a random place in the ocean.
     pub v4: bool,
+    /// Order-2 memory: `dive` leaves two-byte contexts in dx and cx, and `load`/`store` index
+    /// a 4 KB memory by a hash of them, so the 4-op learner predicts from the last two bytes.
+    pub mem2: bool,
+}
+
+/// Size of the order-2 memory, and where a two-byte context lands in it.
+const MEM2: usize = 1 << 12;
+
+fn mem2_index(ctx: u32) -> usize {
+    (((ctx >> 8 & 255) * 0x9E3) ^ ((ctx & 255) * 0x1F)) as usize & (MEM2 - 1)
 }
 
 /// Bytes of genome in the genome ocean each epoch: about half a typical population.
@@ -143,6 +153,7 @@ impl Default for Params {
             genome_ocean: false,
             learned_mut: 0,
             v4: false,
+            mem2: false,
         }
     }
 }
@@ -217,8 +228,9 @@ pub struct Creature {
     /// Private memory, 256 bytes once in use. Children start with a copy of their
     /// mother's, so what one generation learns the next begins with.
     pub mem: Vec<u8>,
-    /// The last byte this lineage read from the ocean.
+    /// The last byte this lineage read from the ocean, and the one before (order-2 memory).
     prev: u8,
+    prev2: u8,
     /// Diving the local reef instead of the ocean, where in it, and what emitting has earned.
     reef_mode: bool,
     reef_pos: u64,
@@ -1448,13 +1460,17 @@ impl World {
             IO => self.io(c),
             LOAD | STORE if !self.p.memory => self.error(c, slot),
             LOAD => {
-                c.cx = c.mem.get(c.cx as usize & 255).copied().unwrap_or(0) as u32;
+                let i = if self.p.mem2 { mem2_index(c.cx) } else { c.cx as usize & 255 };
+                // Under v4 an empty memory guesses the ocean's commonest byte pattern, so a
+                // young learner starts level with a constant guess instead of below it.
+                c.cx = c.mem.get(i).copied().unwrap_or(self.base_guess) as u32;
             }
             STORE => {
+                let (i, n) = if self.p.mem2 { (mem2_index(c.dx), MEM2) } else { (c.dx as usize & 255, 256) };
                 if c.mem.is_empty() {
-                    c.mem = vec![0; 256];
+                    c.mem = vec![self.base_guess; n];
                 }
-                c.mem[c.dx as usize & 255] = c.cx as u8;
+                c.mem[i] = c.cx as u8;
             }
             INFECT => {
                 let (bits, len) = self.template(p + 1);
@@ -1484,7 +1500,13 @@ impl World {
                         // "what came after the last byte" and `load` looks up "what came after
                         // this one": a learner is just `store load guess dive`, and `store`
                         // alone is harmless, so there is a neutral first step toward it.
-                        c.dx = c.prev as u32;
+                        if self.p.mem2 {
+                            // Contexts end in the byte itself, so `store` still files a byte.
+                            c.dx = (c.prev2 as u32) << 8 | c.prev as u32;
+                            c.prev2 = c.prev;
+                        } else {
+                            c.dx = c.prev as u32;
+                        }
                         c.prev = b;
                         if c.has_guess {
                             let s = if self.p.v4 && from.is_none() {
@@ -1502,7 +1524,7 @@ impl World {
                                 Some(e) => self.reef_score(c, e, s),
                             }
                         }
-                        c.cx = b as u32;
+                        c.cx = if self.p.mem2 { (c.dx & 255) << 8 | b as u32 } else { b as u32 };
                     }
                 }
             }
@@ -1691,6 +1713,7 @@ impl World {
         ch.bits_last = c.bits;
         ch.mem = c.mem.clone();
         ch.prev = c.prev;
+        ch.prev2 = c.prev2;
         ch.reef_mode = c.reef_mode;
         self.events.push(Event::Birth {
             mother: c.genotype,
@@ -1942,6 +1965,9 @@ impl World {
             h.update(&z.to_le_bytes());
             h.update(&c.child_writes.to_le_bytes());
             h.update(&c.mem);
+            if self.p.mem2 {
+                h.update(&[c.prev2]);
+            }
         }
         *blake3::hash(&h.0).as_bytes()
     }
