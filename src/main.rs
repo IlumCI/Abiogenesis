@@ -23,7 +23,7 @@ use world::{Params, World};
 
 const USAGE: &str = "abiogenesis
 
-  run     [--out DIR] [--epochs N] [--epoch-instr N] [--seed N] [--soup-bits N] [--feed SPEC] [--sun-bonus N] [--indel N] [--no-tasks] [--ancestor FILE.tasm] [--ocean FILE|genomes] [--ocean-div N] [--max-age N] [--no-memory] [--no-infect] [--reef] [--max-size N] [--economy energy] [--regime feudal|capitalist|evolved] [--social] [--all-ops] [--learned-mut PCT] [--v4] [--mem2] [--energy-total N] [--streams K]
+  run     [--out DIR] [--epochs N] [--epoch-instr N] [--seed N] [--soup-bits N] [--feed SPEC] [--sun-bonus N] [--indel N] [--no-tasks] [--ancestor FILE.tasm] [--ocean FILE|genomes] [--ocean-div N] [--max-age N] [--no-memory] [--no-infect] [--reef] [--max-size N] [--economy energy] [--regime feudal|capitalist|evolved] [--social] [--all-ops] [--learned-mut PCT] [--v4] [--mem2] [--energy-total N] [--streams K] [--debt]
   serve   DIR [run options] [--snapshot-every N]   run forever, resumable
   islands N [run options] [--migrate-every E] [--migrate-count K]
   verify  DIR       replay a run from its seed and feed, check every epoch hash
@@ -453,7 +453,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
     p.genome_ocean = arg_val(args, "--ocean") == Some("genomes");
     p.learned_mut = num("--learned-mut", 0)?.min(100) as u32;
     p.v4 = args.iter().any(|a| a == "--v4");
-    p.debt = p.v4;
+    p.debt = args.iter().any(|a| a == "--debt");
     p.mem2 = args.iter().any(|a| a == "--mem2");
     p.energy_total = num("--energy-total", p.energy_total)?;
     p.streams = num("--streams", 0)?.min(256) as u32;
