@@ -23,7 +23,7 @@ use world::{Params, World};
 
 const USAGE: &str = "abiogenesis
 
-  run     [--out DIR] [--epochs N] [--epoch-instr N] [--seed N] [--soup-bits N] [--feed SPEC] [--sun-bonus N] [--indel N] [--no-tasks] [--ancestor FILE.tasm] [--ocean FILE|genomes] [--ocean-div N] [--max-age N] [--no-memory] [--no-infect] [--reef] [--max-size N] [--economy energy] [--regime feudal|capitalist|evolved] [--social] [--all-ops] [--learned-mut PCT] [--v4] [--mem2] [--energy-total N] [--streams K] [--debt] [--hgt] [--free-copy]
+  run     [--out DIR] [--epochs N] [--epoch-instr N] [--seed N] [--soup-bits N] [--feed SPEC] [--sun-bonus N] [--indel N] [--no-tasks] [--ancestor FILE.tasm] [--ocean FILE|genomes] [--ocean-div N] [--max-age N] [--no-memory] [--no-infect] [--reef] [--max-size N] [--economy energy] [--regime feudal|capitalist|evolved] [--social] [--all-ops] [--learned-mut PCT] [--v4] [--mem2] [--energy-total N] [--streams K] [--debt] [--hgt] [--free-copy] [--birth-cost K]
   serve   DIR [run options] [--snapshot-every N]   run forever, resumable
   islands N [run options] [--migrate-every E] [--migrate-count K]
   verify  DIR       replay a run from its seed and feed, check every epoch hash
@@ -54,10 +54,10 @@ impl Config {
     fn to_text(&self) -> String {
         let p = &self.p;
         format!(
-            "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nstreams={}\ndebt={}\nhgt={}\nfree_copy={}\nops={}\n",
+            "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nstreams={}\ndebt={}\nhgt={}\nfree_copy={}\nbirth_cost={}\nops={}\n",
             self.seed, self.epochs, self.epoch_instr, self.warmup, self.feed, p.soup_bits, p.copy_error,
             p.cosmic_base, p.fill, p.min_size, p.max_size, p.search_limit, p.sun_bonus, p.tasks as u8, p.indel, p.max_merit, p.max_age, self.ocean, ocean_hash(&self.ocean), p.ocean_div, p.ocean_cap, p.memory as u8, p.infect as u8, p.infect_radius, p.reef as u8, self.migrate_every, self.migrate_count, p.energy as u8, p.energy_total, match p.regime { world::Regime::Commons => 0, world::Regime::Feudal => 1, world::Regime::Capitalist => 2, world::Regime::Evolved => 3 },
-            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams, p.debt as u8, p.hgt as u8, p.free_copy as u8,
+            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams, p.debt as u8, p.hgt as u8, p.free_copy as u8, p.birth_cost,
             world::alphabet(p, !self.ocean.is_empty()).iter().map(|&o| isa::NAMES[o as usize]).collect::<Vec<_>>().join(" ")
         )
     }
@@ -109,6 +109,7 @@ impl Config {
                 debt: num("debt").map(|v| v != 0).unwrap_or(false),
                 hgt: num("hgt").map(|v| v != 0).unwrap_or(false),
                 free_copy: num("free_copy").map(|v| v != 0).unwrap_or(false),
+                birth_cost: num("birth_cost").unwrap_or(0),
             },
         })
     }
@@ -458,6 +459,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
     p.debt = args.iter().any(|a| a == "--debt");
     p.hgt = args.iter().any(|a| a == "--hgt");
     p.free_copy = args.iter().any(|a| a == "--free-copy");
+    p.birth_cost = num("--birth-cost", 0)?;
     p.mem2 = args.iter().any(|a| a == "--mem2");
     p.energy_total = num("--energy-total", p.energy_total)?;
     p.streams = num("--streams", 0)?.min(256) as u32;

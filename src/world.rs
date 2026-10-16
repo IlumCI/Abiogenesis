@@ -111,6 +111,10 @@ pub struct Params {
     /// child is whatever the block holds. Every copy "cheat" (junk padding, skipped cells,
     /// copying from anywhere) is allowed; heredity is up to the creatures.
     pub free_copy: bool,
+    /// Energy economy: a child's body costs this much energy per cell, paid by the mother
+    /// into the commons at divide, whatever the cells hold. A mother that can't pay
+    /// can't divide yet. Prices corner-cutting instead of banning it. 0 = free.
+    pub birth_cost: u64,
 }
 
 /// Size of the order-2 memory, and where a two-byte context lands in it.
@@ -176,6 +180,7 @@ impl Default for Params {
             debt: false,
             hgt: false,
             free_copy: false,
+            birth_cost: 0,
         }
     }
 }
@@ -1714,6 +1719,15 @@ impl World {
         if c.child_writes < need {
             self.error(c, slot);
             return;
+        }
+        if self.p.energy && self.p.birth_cost > 0 {
+            let cost = self.p.birth_cost * z as u64;
+            if c.energy < cost {
+                self.error(c, slot);
+                return;
+            }
+            c.energy -= cost;
+            self.pool += cost;
         }
         // The block changes hands: release it from the mother, give it to the child.
         c.child = None;
