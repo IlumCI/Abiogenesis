@@ -1,0 +1,484 @@
+<title>Abiogenesis Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one 16:9 stage canvas (the soup as a microscope plate, instruments to its right), controls underneath. Single dark look by choice: it is a video frame. */
+:root {
+  --ground: #0a0d12;
+  --plate: #0f141b;
+  --line: #1e2834;
+  --ink: #dbe3ea;
+  --muted: #8796a6;
+  --novelty: #f0a64a;
+  --reader: #9ff0ff;
+  --chance: #7f8c9b;
+  --display: "Instrument Serif", "Iowan Old Style", Georgia, serif;
+  --body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font: 15px/1.5 var(--body);
+  padding-inline: 16px;
+  padding-block: 16px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+#stage {
+  width: 100%;
+  max-width: 1600px;
+  aspect-ratio: 16 / 9;
+  height: auto;
+  background: var(--ground);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  display: block;
+}
+.bar {
+  width: 100%;
+  max-width: 1600px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
+}
+.bar button, .bar select {
+  font: 500 14px var(--body);
+  color: var(--ink);
+  background: var(--plate);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.bar button:hover { border-color: var(--muted); }
+.bar button:focus-visible, .bar select:focus-visible, .bar input:focus-visible { outline: 2px solid var(--reader); outline-offset: 2px; }
+.bar button[aria-pressed="true"] { border-color: #e5484d; color: #ffb4b6; }
+#scrub { flex: 1 1 240px; min-width: 0; accent-color: var(--novelty); }
+#status { font: 13px var(--mono); color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+#save { font: 500 14px var(--body); color: var(--reader); }
+#drop {
+  width: 100%;
+  max-width: 1600px;
+  border: 1px dashed var(--line);
+  border-radius: 4px;
+  padding: 20px;
+  box-sizing: border-box;
+  color: var(--muted);
+  font-size: 14px;
+}
+#drop code { font: 13px var(--mono); color: var(--ink); }
+#drop.over { border-color: var(--reader); color: var(--ink); }
+</style>
+
+<canvas id="stage" width="1920" height="1080" aria-label="Soup map and evolution charts"></canvas>
+<div class="bar">
+  <button id="play" type="button">Pause</button>
+  <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Frame">
+  <label for="speed" style="color:var(--muted);font-size:14px">Speed</label>
+  <select id="speed">
+    <option value="10">10 fps</option>
+    <option value="20">20 fps</option>
+    <option value="30" selected>30 fps</option>
+    <option value="60">60 fps</option>
+  </select>
+  <button id="rec" type="button" aria-pressed="false">Record clip</button>
+  <a id="save" hidden>Save clip</a>
+  <span id="status">Loading</span>
+</div>
+<div id="drop" hidden>
+  Drop a <code>film.bin</code> here (made by <code>scripts/pack_film.py</code>), or open this page as
+  <code>viewer/#live=../runs/NAME</code> to watch a running world that writes frames
+  (<code>ABIO_FRAMES=runs/NAME abiogenesis run ...</code>), served with <code>python3 -m http.server</code> from the repo.
+</div>
+
+<script>
+"use strict";
+const W = 1920, H = 1080;
+const stage = document.getElementById("stage");
+const g = stage.getContext("2d");
+const css = getComputedStyle(document.documentElement);
+const C = name => css.getPropertyValue(name).trim();
+const FONT = { display: C("--display"), body: C("--body"), mono: C("--mono") };
+const COL = {
+  ground: C("--ground"), plate: C("--plate"), line: C("--line"), ink: C("--ink"),
+  muted: C("--muted"), novelty: C("--novelty"), reader: C("--reader"), chance: C("--chance"),
+};
+const STAT = ["pop", "diversity", "mean_size", "births", "deaths", "gene_alive", "gene_cum",
+  "new_total", "null_total", "divers", "ocean_bits", "streams_used"];
+
+// One frame: header, stats, then 9 bytes per creature.
+function parseFrame(buf, off = 0) {
+  const v = new DataView(buf, off);
+  if (v.getUint32(0, true) !== 0x31464241) throw new Error("not an ABF1 frame");
+  const epoch = v.getUint32(4, true), bits = v.getUint32(8, true), n = v.getUint32(12, true);
+  const s = { epoch };
+  STAT.forEach((k, i) => { s[k] = v.getFloat32(16 + 4 * i, true); });
+  return { epoch, bits, n, stats: s, view: v };
+}
+
+// Genome length sets the hue: short fast copiers warm, long genomes cool.
+const RAMP = [[255, 122, 89], [255, 196, 87], [128, 214, 126], [72, 186, 214], [140, 132, 255]];
+function rampAt(t) {
+  t = Math.min(1, Math.max(0, t)) * (RAMP.length - 1);
+  const i = Math.min(RAMP.length - 2, Math.floor(t)), f = t - i, a = RAMP[i], b = RAMP[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+const LMIN = Math.log2(16), LMAX = Math.log2(256);
+const sizeT = z => (Math.log2(Math.max(z, 1)) - LMIN) / (LMAX - LMIN);
+
+let soup = null, soupImg = null, soupPx = null, soupW = 0, soupH = 0;
+const groundPx = 0xff000000 | (0x12 << 16) | (0x0d << 8) | 0x0a; // ABGR of --ground
+
+function drawSoup(fr) {
+  const w = 1 << Math.ceil(fr.bits / 2), h = 1 << Math.floor(fr.bits / 2);
+  if (!soup || soupW !== w || soupH !== h) {
+    soup = document.createElement("canvas");
+    soup.width = soupW = w; soup.height = soupH = h;
+    soupImg = soup.getContext("2d").createImageData(w, h);
+    soupPx = new Uint32Array(soupImg.data.buffer);
+  }
+  soupPx.fill(groundPx);
+  const v = fr.view, cells = w * h;
+  for (let i = 0, o = 64; i < fr.n; i++, o += 9) {
+    const start = v.getUint32(o, true), size = v.getUint16(o + 4, true);
+    const geno = v.getUint16(o + 6, true), flags = v.getUint8(o + 8);
+    let [r, gg, b] = rampAt(sizeT(size));
+    const jitter = 0.86 + ((geno * 2654435761) >>> 0) / 4294967296 * 0.28;
+    r *= jitter; gg *= jitter; b *= jitter;
+    if (flags & 2) { r = r * 0.35 + 166; gg = gg * 0.35 + 166; b = b * 0.35 + 166; }
+    else if (flags & 1) { r = r * 0.7 + 50; gg = gg * 0.7 + 60; b = b * 0.7 + 66; }
+    if (flags & 4) { r *= 0.8; gg *= 0.8; b *= 0.8; }
+    const px = 0xff000000 | (Math.min(255, b) << 16) | (Math.min(255, gg) << 8) | Math.min(255, r);
+    const head = 0xff000000 | (Math.min(255, b * 0.55) << 16) | (Math.min(255, gg * 0.55) << 8) | Math.min(255, r * 0.55);
+    for (let k = 0; k < size; k++) soupPx[(start + k) % cells] = k === 0 ? head : px;
+  }
+  soup.getContext("2d").putImageData(soupImg, 0, 0);
+}
+
+const fmt = x => Math.round(x).toLocaleString("en-US");
+
+function text(str, x, y, font, color, align = "left") {
+  g.font = font; g.fillStyle = color; g.textAlign = align; g.textBaseline = "alphabetic";
+  g.fillText(str, x, y);
+}
+
+// A chart panel: faint grid, area-filled series, emphasised endpoint, value labels in a
+// left gutter. A NaN value leaves a gap (no data worth plotting there).
+function chart(x0, y, w0, h, title, note, rows, series, opts = {}) {
+  text(title, x0, y, `500 20px ${FONT.body}`, COL.ink);
+  if (note) text(note, x0 + w0, y, `16px ${FONT.body}`, COL.muted, "right");
+  const gutter = 64, x = x0 + gutter, w = w0 - gutter;
+  const top = y + 16, bot = top + h;
+  g.strokeStyle = COL.line; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const yy = Math.round(top + (h * i) / 4) + 0.5;
+    g.beginPath(); g.moveTo(x, yy); g.lineTo(x + w, yy); g.stroke();
+  }
+  if (rows.length < 2) return;
+  const e0 = rows[0].epoch, e1 = Math.max(rows[rows.length - 1].epoch, e0 + 1);
+  const all = series.flatMap(s => rows.map(s.get)).filter(Number.isFinite);
+  if (!all.length) {
+    if (opts.empty) text(opts.empty, x + w / 2, top + h / 2 + 6, `16px ${FONT.body}`, COL.muted, "center");
+    return;
+  }
+  let lo = opts.min ?? Math.min(0, ...all), hi = Math.max(...all);
+  if (opts.symmetric) { const m = Math.max(Math.abs(lo), Math.abs(hi), 0.25); lo = -m; hi = m; }
+  if (hi - lo < 1e-9) hi = lo + 1;
+  const pad = (hi - lo) * 0.06; hi += pad; if (lo < 0) lo -= pad;
+  const X = e => x + ((e - e0) / (e1 - e0)) * w;
+  const Y = val => bot - ((val - lo) / (hi - lo)) * h;
+  if (lo < 0 && hi > 0) {
+    g.strokeStyle = COL.muted; g.setLineDash([2, 4]);
+    g.beginPath(); g.moveTo(x, Y(0)); g.lineTo(x + w, Y(0)); g.stroke(); g.setLineDash([]);
+  }
+  const step = Math.max(1, Math.floor(rows.length / w));
+  const trace = s => {
+    g.beginPath();
+    let pen = false, first = null, lastPt = null;
+    for (let i = 0; i < rows.length; i += step) {
+      const v = s.get(rows[i]);
+      if (!Number.isFinite(v)) { pen = false; continue; }
+      const px = X(rows[i].epoch), py = Y(v);
+      pen ? g.lineTo(px, py) : g.moveTo(px, py);
+      pen = true; first ??= px; lastPt = [px, py];
+    }
+    const lv = s.get(rows[rows.length - 1]);
+    if (Number.isFinite(lv) && pen) { lastPt = [X(rows[rows.length - 1].epoch), Y(lv)]; g.lineTo(...lastPt); }
+    return { first, lastPt };
+  };
+  for (const s of series) {
+    if (s.fill) {
+      const { first, lastPt } = trace(s);
+      if (lastPt) {
+        g.save();
+        g.lineTo(lastPt[0], Y(Math.max(lo, 0))); g.lineTo(first, Y(Math.max(lo, 0))); g.closePath();
+        g.globalAlpha = 0.16; g.fillStyle = s.color; g.fill(); g.restore();
+      }
+    }
+    const { lastPt } = trace(s);
+    g.strokeStyle = s.color; g.lineWidth = s.width ?? 2.5; g.setLineDash(s.dash ?? []);
+    g.stroke(); g.setLineDash([]);
+    const lv = s.get(rows[rows.length - 1]);
+    if (lastPt && Number.isFinite(lv)) {
+      g.fillStyle = s.color;
+      g.beginPath(); g.arc(lastPt[0], lastPt[1], 4.5, 0, Math.PI * 2); g.fill();
+    }
+  }
+  const lab = opts.label ?? fmt;
+  text(lab(hi - pad), x - 10, Y(hi - pad) + 5, `14px ${FONT.mono}`, COL.muted, "right");
+  text(lab(lo < 0 ? lo + pad : lo), x - 10, Y(lo < 0 ? lo + pad : lo) + 5, `14px ${FONT.mono}`, COL.muted, "right");
+}
+
+function smooth(rows, key, k = 0.08) {
+  let m = null;
+  return rows.map(r => {
+    const raw = r[key];
+    if (r.divers < 20) { m = null; return NaN; }
+    m = m === null ? raw : m + k * (raw - m);
+    return m;
+  });
+}
+
+function render(fr, rows, label) {
+  g.fillStyle = COL.ground; g.fillRect(0, 0, W, H);
+  // The plate: the soup at exactly 2 screen pixels per cell.
+  drawSoup(fr);
+  const side = 1024, ox = 28, oy = 28;
+  g.fillStyle = COL.plate; g.fillRect(ox - 1, oy - 1, side + 2, side + 2);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(soup, ox, oy, side, side * (soupH / soupW));
+  g.strokeStyle = COL.line; g.lineWidth = 1; g.strokeRect(ox - 0.5, oy - 0.5, side + 1, side + 1);
+
+  const x = 1110, w = 770, s = fr.stats;
+  text("Abiogenesis", x, 104, `84px ${FONT.display}`, COL.ink);
+  text(`Self-copying programs in ${fmt(soupW * soupH)} cells of shared memory, paid for predicting Wikipedia`,
+    x, 140, `19px ${FONT.body}`, COL.muted);
+  text(`epoch ${fmt(fr.epoch)}`, x, 200, `500 34px ${FONT.mono}`, COL.ink);
+  if (label) text(label, x + w, 200, `16px ${FONT.mono}`, COL.muted, "right");
+
+  const tiles = [
+    ["organisms", fmt(s.pop), COL.ink],
+    ["genotypes", fmt(s.diversity), COL.ink],
+    ["mean genome, cells", fmt(s.mean_size), COL.ink],
+    ["reading Wikipedia", fmt(s.divers), COL.reader],
+  ];
+  const tw = w / tiles.length;
+  tiles.forEach(([k, val, col], i) => {
+    const tx = x + i * tw;
+    text(val, tx, 262, `500 34px ${FONT.mono}`, col);
+    text(k.toUpperCase(), tx, 290, `500 13px ${FONT.body}`, COL.muted);
+  });
+
+  const bits = smooth(rows, "ocean_bits");
+  const rowsB = rows.map((r, i) => ({ epoch: r.epoch, b: bits[i] }));
+  chart(x, 350, w, 250, "New adaptive genes, cumulative",
+    "rising = still inventing, flat = plateau", rows, [
+      { get: r => r.null_total, color: COL.chance, dash: [6, 6], width: 2 },
+      { get: r => r.new_total, color: COL.novelty, fill: true },
+    ]);
+  text("real", x, 640, `500 15px ${FONT.body}`, COL.novelty);
+  text("by chance (null shadow)", x + 50, 640, `15px ${FONT.body}`, COL.chance);
+  chart(x, 690, w, 120, "Organisms and readers", "grey: organisms, blue: reading", rows, [
+    { get: r => r.pop, color: COL.muted, width: 2 },
+    { get: r => r.divers, color: COL.reader, fill: true },
+  ]);
+  chart(x, 870, w, 90, "Prediction, bits per guess beyond a constant guess", null, rowsB, [
+    { get: r => r.b, color: COL.reader, width: 2 },
+  ], { symmetric: true, label: v => (v >= 0 ? "+" : "") + v.toFixed(2), empty: "no organisms reading yet" });
+
+  // Legend for the plate.
+  const ly = 1030, lx = x, lw = 300;
+  for (let i = 0; i < lw; i++) {
+    const [r, gg, b] = rampAt(i / lw);
+    g.fillStyle = `rgb(${r | 0},${gg | 0},${b | 0})`; g.fillRect(lx + i, ly, 1, 12);
+  }
+  text("16", lx, ly + 34, `14px ${FONT.mono}`, COL.muted);
+  text("genome length, cells", lx + lw / 2, ly + 34, `14px ${FONT.body}`, COL.muted, "center");
+  text("256+", lx + lw, ly + 34, `14px ${FONT.mono}`, COL.muted, "right");
+  g.fillStyle = "rgb(230,240,244)"; g.fillRect(lx + 350, ly, 24, 12);
+  text("predicting the next byte now", lx + 384, ly + 11, `14px ${FONT.body}`, COL.muted);
+  text("each row is 512 cells of one circular memory", lx + 384, ly + 34, `14px ${FONT.body}`, COL.muted);
+}
+
+// ---- Sources: a packed film, or a live frames directory. ----
+const ui = {
+  play: document.getElementById("play"), scrub: document.getElementById("scrub"),
+  speed: document.getElementById("speed"), rec: document.getElementById("rec"),
+  save: document.getElementById("save"), status: document.getElementById("status"),
+  drop: document.getElementById("drop"),
+};
+let frames = [], rows = [], idx = 0, playing = true, live = null, label = "";
+
+function loadFilm(buf, name) {
+  const v = new DataView(buf);
+  const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 7));
+  if (magic !== "ABFILM1") throw new Error("not a film.bin");
+  const count = v.getUint32(8, true);
+  const labelLen = v.getUint32(12, true);
+  label = new TextDecoder().decode(new Uint8Array(buf, 16, labelLen));
+  let off = 16 + labelLen;
+  frames = [];
+  for (let i = 0; i < count; i++) {
+    const len = v.getUint32(off, true);
+    frames.push(parseFrame(buf, off + 4));
+    off += 4 + len;
+  }
+  rows = frames.map(f => f.stats);
+  idx = 0;
+  ui.scrub.max = String(frames.length - 1);
+  ui.drop.hidden = true;
+  ui.status.textContent = `${name}: ${frames.length} frames, epochs ${fmt(rows[0].epoch)} to ${fmt(rows[rows.length - 1].epoch)}`;
+}
+
+async function startLive(dir) {
+  live = { dir: dir.replace(/\/$/, ""), latest: -1, lastStats: 0 };
+  label = dir.split("/").filter(Boolean).pop() + " \u00b7 live";
+  ui.scrub.disabled = true; ui.play.disabled = true;
+  const tick = async () => {
+    try {
+      const t = await fetch(`${live.dir}/latest`, { cache: "no-store" });
+      if (t.ok) {
+        const e = parseInt(await t.text(), 10);
+        if (e !== live.latest) {
+          const f = await fetch(`${live.dir}/${String(e).padStart(8, "0")}.abf`, { cache: "no-store" });
+          if (f.ok) {
+            frames = [parseFrame(await f.arrayBuffer())];
+            live.latest = e;
+            if (Date.now() - live.lastStats > 4000 || rows.length === 0) {
+              live.lastStats = Date.now();
+              const c = await fetch(`${live.dir}/stats.csv`, { cache: "no-store" });
+              if (c.ok) rows = parseStats(await c.text());
+            }
+            if (!rows.length || rows[rows.length - 1].epoch < e) rows.push(frames[0].stats);
+            ui.status.textContent = `live: epoch ${fmt(e)}`;
+          }
+        }
+      } else {
+        ui.status.textContent = `waiting for ${live.dir}/latest`;
+      }
+    } catch (err) {
+      ui.status.textContent = `live source unreachable: ${err.message}. Serve the repo with python3 -m http.server.`;
+    }
+    setTimeout(tick, 400);
+  };
+  tick();
+}
+
+function parseStats(csv) {
+  const lines = csv.trim().split("\n");
+  const head = lines.shift().split(",");
+  const byEpoch = new Map();
+  for (const l of lines) {
+    const p = l.split(",").map(Number);
+    if (p.length !== head.length) continue;
+    const r = {};
+    head.forEach((k, i) => { r[k] = p[i]; });
+    byEpoch.set(r.epoch, r);
+  }
+  return [...byEpoch.values()].sort((a, b) => a.epoch - b.epoch);
+}
+
+let lastT = 0;
+function loop(t) {
+  if (frames.length) {
+    if (!live && playing && t - lastT >= 1000 / Number(ui.speed.value)) {
+      lastT = t;
+      idx = (idx + 1) % frames.length;
+      ui.scrub.value = String(idx);
+    }
+    const fr = live ? frames[0] : frames[idx];
+    const upto = live ? rows : rows.slice(0, idx + 1);
+    render(fr, upto, label);
+  }
+  requestAnimationFrame(loop);
+}
+
+ui.play.addEventListener("click", () => {
+  playing = !playing;
+  ui.play.textContent = playing ? "Pause" : "Play";
+});
+ui.scrub.addEventListener("input", () => { idx = Number(ui.scrub.value); });
+
+let rec = null, chunks = [];
+ui.rec.addEventListener("click", () => {
+  if (rec) { rec.stop(); return; }
+  if (!stage.captureStream || typeof MediaRecorder === "undefined") {
+    ui.status.textContent = "This browser cannot record a canvas. Try Chrome or Firefox.";
+    return;
+  }
+  const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find(t => MediaRecorder.isTypeSupported(t));
+  rec = new MediaRecorder(stage.captureStream(30), { mimeType: type, videoBitsPerSecond: 16_000_000 });
+  chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const url = URL.createObjectURL(new Blob(chunks, { type: "video/webm" }));
+    ui.save.href = url; ui.save.download = "abiogenesis.webm"; ui.save.hidden = false;
+    ui.status.textContent = "Clip ready. For X or Reddit: ffmpeg -i abiogenesis.webm -c:v libx264 -pix_fmt yuv420p -crf 18 abiogenesis.mp4";
+    ui.rec.textContent = "Record clip"; ui.rec.setAttribute("aria-pressed", "false");
+    rec = null;
+  };
+  if (!live) { idx = 0; playing = true; ui.play.textContent = "Pause"; }
+  rec.start(1000);
+  ui.rec.textContent = "Stop recording"; ui.rec.setAttribute("aria-pressed", "true");
+  ui.status.textContent = "Recording";
+});
+
+ui.drop.addEventListener("dragover", e => { e.preventDefault(); ui.drop.classList.add("over"); });
+ui.drop.addEventListener("dragleave", () => ui.drop.classList.remove("over"));
+ui.drop.addEventListener("drop", async e => {
+  e.preventDefault(); ui.drop.classList.remove("over");
+  const f = e.dataTransfer.files[0];
+  if (!f) return;
+  try { loadFilm(await f.arrayBuffer(), f.name); }
+  catch (err) { ui.status.textContent = `${f.name}: ${err.message}`; }
+});
+
+async function boot() {
+  await Promise.all([
+    document.fonts.load(`84px ${FONT.display}`), document.fonts.load(`20px ${FONT.body}`),
+    document.fonts.load(`500 20px ${FONT.body}`), document.fonts.load(`34px ${FONT.mono}`),
+    document.fonts.load(`500 34px ${FONT.mono}`),
+  ]).catch(() => {});
+  // #film=URL, #live=DIR, and optionally &at=FRAME|end to open paused on one frame.
+  const q = new URLSearchParams(location.hash.slice(1));
+  const liveDir = q.get("live");
+  const filmUrl = q.get("film") || "film.bin";
+  const at = q.get("at");
+  if (liveDir) startLive(liveDir);
+  else {
+    try {
+      const r = await fetch(filmUrl);
+      if (!r.ok) throw new Error(`${filmUrl}: ${r.status}`);
+      loadFilm(await r.arrayBuffer(), filmUrl.split("/").pop());
+      if (at !== null) {
+        idx = at === "end" ? frames.length - 1 : Math.min(frames.length - 1, Math.max(0, parseInt(at, 10) || 0));
+        ui.scrub.value = String(idx);
+        playing = false; ui.play.textContent = "Play";
+      }
+    } catch (err) {
+      ui.drop.hidden = false;
+      ui.status.textContent = "No film loaded.";
+      g.fillStyle = COL.ground; g.fillRect(0, 0, W, H);
+      text("Abiogenesis", 80, 200, `84px ${FONT.display}`, COL.ink);
+      text("Drop a film.bin below, or open with #live=path to a frames directory.", 80, 250, `22px ${FONT.body}`, COL.muted);
+    }
+  }
+  requestAnimationFrame(loop);
+}
+// For scripts/render_film.mjs: draw one frame and return the canvas as a PNG data URL.
+window.abioFrames = () => frames.length;
+window.abioShot = i => {
+  playing = false; idx = i;
+  render(frames[i], rows.slice(0, i + 1), label);
+  return stage.toDataURL("image/png");
+};
+boot();
+</script>

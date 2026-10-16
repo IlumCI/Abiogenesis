@@ -1,4 +1,5 @@
 ﻿mod feed;
+mod film;
 mod isa;
 mod meter;
 mod modes;
@@ -192,6 +193,7 @@ fn simulate(
     if let Some(s) = sinks.as_mut().filter(|_| !resumed) {
         writeln!(s.census, "epoch,instr,pop,diversity,size_classes,mean_size,min_size,max_size,mean_activity,new_activity,shadow_diversity,shadow_new_activity,excess,births,deaths,sun_center,sun_half,cosmic_interval,goal,computing,mean_merit,task_not,task_nand,task_and,task_orn,task_or,task_andn,task_nor,task_xor,task_equ,task_echo,scratch,mother_scratch,lost_resize,lost_indel,lost_point,gained,resized_births,divers,ocean_acc,ocean_best,ocean_bits,modes_change,modes_novelty,modes_complexity,modes_ecology,observer_bits,infections,reef_emits,reef_reads,kin_reads,norm_cum,norm_median,norm_new,pool,ledger_gap,gini,top_share,rent,evictions,enclosures,revolts_won,revolts_lost,gifts,gifted,titled,mean_levy,matings,lessons,joins,groups,largest_group,died_old,died_starved,died_reaped,gene_alive,gene_cum,gene_median,gene_new,gene_null_new,streams_used,dominant").ok();
     }
+    let mut film = film::Film::from_env();
     let t0 = Instant::now();
     for e in e0..cfg.epochs {
         let fb = feed.next()?;
@@ -201,6 +203,9 @@ fn simulate(
         }
         prof::time(prof::RUN, || w.run(cfg.epoch_instr));
         let (c, notes) = prof::time(prof::CENSUS, || m.census(&mut w));
+        if let Some(f) = film.as_mut() {
+            f.frame(e, &w, &c);
+        }
         if std::env::var_os("ABIO_AUDIT").is_some() {
             let (u, o) = w.audit();
             if u != o {

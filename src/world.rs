@@ -474,6 +474,21 @@ impl World {
         self.stream_of(pos).map(|k| (k as u8).wrapping_mul(157)).unwrap_or(0)
     }
 
+    /// For the viewer: each living creature's span, low genotype bits, and flags (1: its
+    /// genome holds both `dive` and `guess`, 2: it guessed last cycle, 4: it is broke).
+    pub fn frame_spans(&self) -> Vec<(u32, u16, u16, u8)> {
+        self.cs
+            .iter()
+            .filter(|c| c.alive)
+            .map(|c| {
+                let body = &self.soup[c.start as usize..(c.start + c.size) as usize];
+                let learner = body.contains(&DIVE) && body.contains(&GUESS);
+                let flags = learner as u8 | ((c.scored_last >= 4) as u8) << 1 | ((self.p.energy && c.energy == 0) as u8) << 2;
+                (c.start, c.size.min(u16::MAX as u32) as u16, c.genotype as u16, flags)
+            })
+            .collect()
+    }
+
     /// Streams with at least one creature that guessed there last cycle.
     pub fn streams_used(&self) -> u32 {
         let mut seen = vec![false; self.stream_rate.len()];

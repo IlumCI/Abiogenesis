@@ -110,6 +110,29 @@ a time, at below-normal priority.
 Outputs per run: `report.html`, `census.csv`, `events.log`, `genebank/*.tasm`, `config.txt`,
 `feed.log` and `chain.log` (used by `verify`).
 
+### Viewer
+
+`viewer/index.html` draws the soup (every cell, coloured by genome length; creatures
+predicting the ocean glow) beside the cumulative count of new significant genes against
+chance, population, readers and prediction bits. It reads frames that any `run`, `serve`
+or `verify` writes when `ABIO_FRAMES` is set; frames only read the world, so hashes are
+unchanged.
+
+```
+# live: watch a world as it runs
+ABIO_FRAMES=runs/w1/frames ABIO_FRAME_EVERY=5 abiogenesis run --epochs 20000 ... --out runs/w1
+python3 -m http.server 8000      # from the repo root
+# open http://localhost:8000/viewer/#live=../runs/w1/frames
+
+# film: replay a finished run, pack it, render an MP4 (needs ffmpeg and playwright-core)
+ABIO_FRAMES=runs/film ABIO_FRAME_EVERY=10 abiogenesis verify runs/w1
+python3 scripts/pack_film.py runs/film runs/film.bin --label "seed 1"
+node scripts/render_film.mjs runs/film.bin runs/film.mp4
+# or open http://localhost:8000/viewer/#film=../runs/film.bin (add &at=end for a still)
+```
+
+The page's Record button saves a .webm of whatever it is showing.
+
 Replay: a run is a pure function of its config, seed and feed. `verify` re-runs it and checks
 every epoch's hash. Speed: free space is tracked one bit per cell, and template searches are
 cached per genotype. `cargo build --release --features prof` prints where the time goes.

@@ -200,8 +200,9 @@ find out why before trusting any comparison with Windows-era results.
 - **The original Bedau–Packard meter was biased.** Use Channon's test.
 - **Stacking mechanisms got us lost** (51 ops, nothing proven). Test one hypothesis at a
   time; unproven ops stay out of the mutation alphabet (`--all-ops` restores them).
-- **Out of scope until something wins:** live world, viewer, token mechanics, regimes and
-  politics, social ops.
+- **Out of scope until something wins:** live world, token mechanics, regimes and politics,
+  social ops. The owner asked for a viewer on 2026-10-16 (`viewer/`, README); it only
+  observes and changes no results.
 
 ## Process
 
