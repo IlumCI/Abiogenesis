@@ -3,6 +3,9 @@
 //! quarter's mean above the second quarter's) and above B's, and A's new adaptively
 //! significant components keep coming (second half at least half the first) and outnumber
 //! B's. Eight wins in ten is a WIN.
+//!
+//! It judges twice when both arms have the columns: on whole genotypes (`norm_*`, the
+//! fixed rule) and on genes (`gene_*`, Channon's own choice of component in Geb).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,13 +33,13 @@ impl Series {
     }
 }
 
-fn load(dir: &Path) -> Result<Series, String> {
+fn load(dir: &Path, cum_col: &str, new_col: &str) -> Result<Series, String> {
     let raw = fs::read(dir.join("census.csv")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let text: String = String::from_utf8_lossy(&raw).chars().filter(|&c| c != '\0').collect();
     let mut lines = text.lines();
     let head: Vec<&str> = lines.next().ok_or("empty census")?.split(',').collect();
     let col = |n: &str| head.iter().position(|h| *h == n).ok_or(format!("no column {n}"));
-    let (pop, div, cum, new, gap) = (col("pop")?, col("diversity")?, col("norm_cum")?, col("norm_new")?, col("ledger_gap"));
+    let (pop, div, cum, new, gap) = (col("pop")?, col("diversity")?, col(cum_col)?, col(new_col)?, col("ledger_gap"));
     let rows: Vec<Vec<f64>> = lines
         .map(|l| l.split(',').map(|x| x.parse().unwrap_or(0.0)).collect::<Vec<f64>>())
         .filter(|r| r.len() == head.len())
@@ -86,18 +89,30 @@ fn sign_p(k: usize, n: usize) -> f64 {
 }
 
 pub fn compare(a: &str, b: &str) -> Result<(), String> {
+    judge(a, b, "genotypes", "norm_cum", "norm_new")?;
+    let has_genes = |p: &str| {
+        seeds(p).first().and_then(|(_, d)| fs::read_to_string(d.join("census.csv")).ok()).is_some_and(|t| t.lines().next().unwrap_or("").contains("gene_cum"))
+    };
+    if has_genes(a) && has_genes(b) {
+        println!();
+        judge(a, b, "genes", "gene_cum", "gene_new")?;
+    }
+    Ok(())
+}
+
+fn judge(a: &str, b: &str, unit: &str, cum_col: &str, new_col: &str) -> Result<(), String> {
     let (sa, sb) = (seeds(a), seeds(b));
     let pairs: Vec<(u64, &PathBuf, &PathBuf)> =
         sa.iter().filter_map(|(s, pa)| sb.iter().find(|(t, _)| t == s).map(|(_, pb)| (*s, pa, pb))).collect();
     if pairs.is_empty() {
         return Err(format!("no paired seeds for {a} and {b}"));
     }
-    println!("A = {a}, B = {b}");
+    println!("A = {a}, B = {b}, components = {unit}");
     println!("seed | A: epochs pop div  q2_cum  q4_cum  new h1/h2 | B: epochs pop div  q2_cum  q4_cum  new h1/h2 | grow sust | win");
     let mut wins = 0;
     let mut warn = Vec::new();
     for (seed, pa, pb) in &pairs {
-        let (x, y) = (load(pa)?, load(pb)?);
+        let (x, y) = (load(pa, cum_col, new_col)?, load(pb, cum_col, new_col)?);
         let grow = x.growing() && x.q4_cum > y.q4_cum;
         let sust = x.sustained() && x.new_h2 > y.new_h2;
         let win = grow && sust && !x.extinct();
@@ -130,7 +145,7 @@ pub fn compare(a: &str, b: &str) -> Result<(), String> {
     let n = pairs.len();
     let p = sign_p(wins, n);
     let verdict = if n >= 10 && wins * 10 >= n * 8 { "WIN" } else { "FAIL" };
-    println!("verdict: {wins}/{n} pairs, sign-test p = {p:.3}: {verdict}");
+    println!("verdict ({unit}): {wins}/{n} pairs, sign-test p = {p:.3}: {verdict}");
     Ok(())
 }
 

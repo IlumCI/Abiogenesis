@@ -87,7 +87,8 @@ impl Tracker {
             .max()
             .unwrap_or(0);
 
-        let mut by_pheno: HashMap<u32, u64> = HashMap::new();
+        // Ordered, so the float sum below comes out the same in every process.
+        let mut by_pheno: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
         for p in &alive {
             *by_pheno.entry(phenotype(p)).or_default() += p.pop as u64;
         }

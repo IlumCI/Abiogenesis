@@ -62,6 +62,7 @@ pub struct Census {
     pub ocean_bits: f64,
     pub modes: crate::modes::Modes,
     pub norm: crate::channon::Normalised,
+    pub genes: crate::genes::GeneStats,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -84,6 +85,7 @@ pub struct Meter {
     ocean_level: u32,
     modes: crate::modes::Tracker,
     channon: crate::channon::ResetShadow,
+    genes: crate::genes::GeneMeter,
     sizes_established: HashMap<u32, ()>,
     dominant: u64,
 }
@@ -119,6 +121,7 @@ impl Meter {
             ocean_level: 0,
             modes: crate::modes::Tracker::new(),
             channon: crate::channon::ResetShadow::new(seed, ancestor),
+            genes: crate::genes::GeneMeter::new(seed),
             sizes_established: HashMap::new(),
             dominant: ancestor,
         };
@@ -157,8 +160,9 @@ impl Meter {
         let mut notes = Vec::new();
         let (mut births, mut deaths) = (0u64, 0u64);
         for ev in std::mem::take(&mut w.events) {
+            crate::prof::time(crate::prof::GENE_EVENTS, || self.genes.event(&ev));
             match ev {
-                Event::Birth { mother, mother_now, child, child_size, foreign, sensed, tasks } => {
+                Event::Birth { mother, mother_now, child, child_size, foreign, sensed, tasks, .. } => {
                     births += 1;
                     let mutant = mother != child;
                     self.channon.birth(mutant);
@@ -180,7 +184,7 @@ impl Meter {
                     self.ghost_pop.push(gid);
                     self.ghosts.entry(gid).or_default().pop += 1;
                 }
-                Event::Death { genotype } => {
+                Event::Death { genotype, .. } => {
                     self.channon.death();
                     deaths += 1;
                     if let Some(g) = self.genos.get_mut(&genotype) {
@@ -284,6 +288,7 @@ impl Meter {
         w.train(&fresh);
         let real: Vec<(u64, u32)> = { let mut v: Vec<(u64, u32)> = self.genos.iter().map(|(&g, x)| (g, x.pop)).collect(); v.sort_unstable(); v };
         let norm = self.channon.census(&real);
+        let genes = crate::prof::time(crate::prof::GENE_CENSUS, || self.genes.census(w));
 
         let mut shadow_new = 0;
         for gh in self.ghosts.values_mut().filter(|g| g.pop > 0) {
@@ -390,6 +395,7 @@ impl Meter {
             ocean_bits: if divers > 0 { bits_sum / divers as f64 } else { 0.0 },
             modes,
             norm,
+            genes,
         };
         (c, notes)
     }

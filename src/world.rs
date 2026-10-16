@@ -230,9 +230,16 @@ pub struct Creature {
     mate: Option<(u32, u64)>,
     pub group: u64,
     reap_score: i64,
+    /// Which cells of its own body this creature has executed, for the gene meter.
+    pub ran: [u64; 8],
 }
 
 impl Creature {
+    /// Whether its body has changed since birth, so it no longer matches its genotype.
+    pub fn dirty_body(&self) -> bool {
+        self.dirty
+    }
+
     fn owns(&self, a: u32) -> bool {
         (a >= self.start && a < self.start + self.size)
             || matches!(self.child, Some((s, z)) if a >= s && a < s + z)
@@ -272,9 +279,13 @@ pub enum Event {
         foreign: bool,
         sensed: bool,
         tasks: u16,
+        /// The child's genome, for mutants only (empty when it bred true).
+        code: Vec<u8>,
     },
     Death {
         genotype: u64,
+        /// Cells of its own body it executed, all zero if its body had changed.
+        ran: [u64; 8],
     },
 }
 
@@ -521,7 +532,7 @@ impl World {
             let g = genotype_of(code);
             let slot = self.spawn(at, size, g, 1, 0);
             self.endow(slot, 10_000);
-            self.events.push(Event::Birth { mother: g, mother_now: g, child: g, child_size: size, foreign: false, sensed: false, tasks: 0 });
+            self.events.push(Event::Birth { mother: g, mother_now: g, child: g, child_size: size, foreign: false, sensed: false, tasks: 0, code: Vec::new() });
         }
     }
 
@@ -1011,7 +1022,7 @@ impl World {
         }
         self.alive -= 1;
         self.free_slots.push(slot);
-        self.events.push(Event::Death { genotype: c.genotype });
+        self.events.push(Event::Death { genotype: c.genotype, ran: if c.dirty { [0; 8] } else { c.ran } });
     }
 
     /// Kill whoever is at the top of the reaper queue, sparing `spare`.
@@ -1033,6 +1044,45 @@ impl World {
     }
 
     fn find_free_inner(&self, from: u32, size: u32, window: u32) -> Option<u32> {
+        if size == 0 || size > 64 || self.n % 64 != 0 {
+            return self.find_free_scan(from, size, window);
+        }
+        // The same answer as the scan, a word at a time: the first cell, in scan order from
+        // `from`, that starts `size` free cells, without crossing the end of the soup and
+        // within `limit` scanned cells. Bit b of `starts` says cells b..b+size of this word
+        // and the next are all free (each round doubles the run length it checks).
+        let words = self.occ.len();
+        let limit = window.min(self.n) as i64 + size as i64;
+        let mut w = (from / 64) as usize;
+        let mut base = -((from % 64) as i64);
+        while base <= limit - size as i64 {
+            let next = if w + 1 < words { !self.occ[w + 1] } else { 0 };
+            let x = (next as u128) << 64 | !self.occ[w] as u128;
+            let (mut r, mut m) = (x, 1u32);
+            while m < size {
+                let s = m.min(size - m);
+                r &= r >> s;
+                m += s;
+            }
+            let mut starts = r as u64;
+            if base < 0 {
+                starts &= !0u64 << (-base) as u32;
+            }
+            let last = limit - size as i64 - base;
+            if last < 63 {
+                starts &= (1u64 << (last + 1)) - 1;
+            }
+            if starts != 0 {
+                return Some(w as u32 * 64 + starts.trailing_zeros());
+            }
+            base += 64;
+            w = if w + 1 == words { 0 } else { w + 1 };
+        }
+        None
+    }
+
+    /// Cell-run scan for `find_free`, used for children over 64 cells.
+    fn find_free_scan(&self, from: u32, size: u32, window: u32) -> Option<u32> {
         let (n, mut i, mut run, mut run_start) = (self.n, from, 0u32, from);
         let limit = window.min(n) as u64 + size as u64;
         let mut scanned = 0u64;
@@ -1229,6 +1279,10 @@ impl World {
         }
         if !c.owns(p) {
             c.ran_foreign = true;
+        }
+        let off = p.wrapping_sub(c.start);
+        if off < c.size.min(512) {
+            c.ran[off as usize / 64] |= 1 << (off % 64);
         }
         let mut next = p.wrapping_add(1);
         if op >= 64 || self.enabled & 1 << op == 0 {
@@ -1508,7 +1562,9 @@ impl World {
             self.crossover(s, z, ps as usize, pid);
         }
         let g = genotype_of(&self.soup[s as usize..(s + z) as usize]);
-        let mother_now = genotype_of(&self.soup[c.start as usize..(c.start + c.size) as usize]);
+        // An unchanged body still hashes to the genotype it was born with: `dirty` is set by
+        // every write into a creature's own body and never cleared.
+        let mother_now = if c.dirty { genotype_of(&self.soup[c.start as usize..(c.start + c.size) as usize]) } else { c.genotype };
         let count = |w: &World, a: u32, n: u32| w.soup[a as usize..(a + n) as usize].iter().filter(|&&o| o == NOPX).count() as u64;
         let (m_nopx, c_nopx) = (count(self, c.start, c.size), count(self, s, z));
         let st = &mut self.stats;
@@ -1581,6 +1637,7 @@ impl World {
             foreign: c.ran_foreign,
             sensed: c.sensed,
             tasks: c.tasks_now,
+            code: if g != c.genotype { self.soup[s as usize..(s + z) as usize].to_vec() } else { Vec::new() },
         });
         c.merit = merit;
         c.tasks_last = c.tasks_now;
@@ -1763,13 +1820,26 @@ impl World {
         (self.used, self.owner.iter().filter(|&&o| o != 0).count() as u64)
     }
 
+    /// Living slots in the order the reaper would take them, next victim first.
+    pub fn reap_order(&self) -> Vec<usize> {
+        self.reaper.iter().map(|k| k.2).collect()
+    }
+
     pub fn genome(&self, c: &Creature) -> &[u8] {
         &self.soup[c.start as usize..(c.start + c.size) as usize]
     }
 
     /// Everything that determines the future, hashed. Two honest replays agree on this.
     pub fn state_hash(&self) -> [u8; 32] {
-        let mut h = blake3::Hasher::new();
+        // Everything goes into one buffer and is hashed once: blake3 gives the same digest
+        // however the input is split, and a hundred thousand tiny updates cost 4 ms an epoch.
+        struct Buf(Vec<u8>);
+        impl Buf {
+            fn update(&mut self, b: &[u8]) {
+                self.0.extend_from_slice(b);
+            }
+        }
+        let mut h = Buf(Vec::with_capacity(self.soup.len() + (1 << 16) + self.cs.len() * 512));
         h.update(&self.soup);
         h.update(&self.rng.state_bytes());
         h.update(&self.instr.to_le_bytes());
@@ -1806,6 +1876,45 @@ impl World {
             h.update(&c.child_writes.to_le_bytes());
             h.update(&c.mem);
         }
-        *h.finalize().as_bytes()
+        *blake3::hash(&h.0).as_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The word-at-a-time free-space search must give exactly the scan's answer.
+    #[test]
+    fn find_free_matches_scan() {
+        let p = Params { soup_bits: 10, ..Default::default() };
+        let mut w = World::new(p, 1, Vec::new());
+        let mut rng = Rng::new(7);
+        for round in 0..4000 {
+            // Occupancy from sparse to nearly full, in runs like creatures leave.
+            let fill = rng.below(100);
+            let mut a = 0usize;
+            w.occ.iter_mut().for_each(|x| *x = 0);
+            while a < w.n as usize {
+                let len = 1 + rng.below(40) as usize;
+                let taken = rng.below(100) < fill;
+                for c in a..(a + len).min(w.n as usize) {
+                    if taken {
+                        w.occ[c / 64] |= 1 << (c % 64);
+                    }
+                }
+                a += len;
+            }
+            for _ in 0..20 {
+                let from = rng.below(w.n as u64) as u32;
+                let size = 1 + rng.below(64) as u32;
+                let window = [0, 1, 63, 64, 100, 4096, w.n, w.n * 2][rng.below(8) as usize] + rng.below(3) as u32;
+                assert_eq!(
+                    w.find_free_inner(from, size, window),
+                    w.find_free_scan(from, size, window),
+                    "round {round} from {from} size {size} window {window}"
+                );
+            }
+        }
     }
 }

@@ -9,13 +9,15 @@ pub const CENSUS: usize = 4;
 pub const STATE_HASH: usize = 5;
 pub const KILL: usize = 6;
 pub const FIND_FREE: usize = 7;
-const NAMES: [&str; 8] = ["run (all)", "template search", "mal", "divide", "census", "state hash", "kill", "find_free"];
+pub const GENE_EVENTS: usize = 8;
+pub const GENE_CENSUS: usize = 9;
+const NAMES: [&str; 10] = ["run (all)", "template search", "mal", "divide", "census", "state hash", "kill", "find_free", "gene events", "gene census"];
 
 #[cfg(feature = "prof")]
 mod imp {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    pub static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    pub static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    pub static NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    pub static CALLS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     #[inline]
     pub fn time<R>(i: usize, f: impl FnOnce() -> R) -> R {

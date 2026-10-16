@@ -19,7 +19,9 @@ Tierra-style world has hit so far. Progress is judged by Channon's shadow-resett
   sets how hard cosmic rays hit. The `sense` op points a creature's children toward the sun.
 - **The ocean** (`--ocean FILE`): a sea of real data the creatures know nothing about.
   `guess` declares the next byte, `dive` reads it. Guesses are scored bit by bit (bits right
-  minus 4), so blind guessing earns nothing and every step of better prediction pays. A
+  minus 4), and every step of better prediction pays. Blind guessing is not quite zero:
+  each cycle's total is floored at 0, and a constant guess gets text's shared high bits
+  free (about +1.6 per guess on enwik8; `scripts/ceiling.py`). A
   child swims on from where its mother stopped, so lineages can't memorize, only learn
   patterns. The file's hash goes in the config; `verify` refuses another sea.
   `--ocean genomes` makes the sea a sample of the living population's own genomes, rebuilt
@@ -57,6 +59,10 @@ Every child was then a "new" genotype, and the novelty measure read zero.
 - **Channon's test** (ALife VIII, 2002): after every census a shadow population restarts
   from the real one and replays its births and deaths with random parents and victims. A
   genotype gains activity only by outlasting what chance would have kept.
+- **Gene-level test** (`gene_*` columns): the same method with genes as components, as in
+  Channon's Geb. A gene is the code between two labels, counted once it has run.
+  `gene_null_new` is a second shadow scored against the first: what chance alone marks
+  significant.
 - **Bounded vs unbounded**: bounded novelty (class 2) means normalised activity levels off;
   unbounded (class 3) means it keeps growing and new significant genotypes keep arriving.
 - **`abiogenesis compare A B`** judges runs `A_1..A_10` against controls `B_1..B_10`. A
@@ -92,7 +98,7 @@ abiogenesis islands ...   # several worlds with migration
 ```
 
 Oceans aren't in the repo. enwik8 (100 MB of Wikipedia, the Hutter Prize file) is at
-http://mattmahoney.net/dc/enwik8.zip; unzip it into `oceans/`.
+https://mattmahoney.net/dc/enwik8.zip; unzip it into `oceans/`.
 
 `scripts/queue.sh` (Linux) and `scripts/queue.ps1` (Windows) run a 10-seed batch of one or more experiment arms, a fixed number at
 a time, at below-normal priority.

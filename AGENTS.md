@@ -13,13 +13,50 @@ to Linux.
 - **Known:** baseline worlds show bounded novelty (class 2), the Tierra/Avida plateau.
 - **Experiment 1, reef** (`--reef`): **FAIL**. It lost every pair that finished; mostly
   judged before the full-copy fixes below, but the verdict was settled early.
-- **Experiments 2 and 3 were running when the Windows PC shut down, and are lost.** Rerun
-  them first, from scratch, on this build:
-  - 2: genome ocean (`--ocean genomes`);
-  - 3: learned mutation (`--learned-mut 25`);
-  - both against the lean baseline control (`LB_base`).
-- Partial data (seeds 1–4, halfway) showed no meltdowns, tiny fast replicators (about 30–37
-  cells), and slightly higher novelty in the genome-ocean arm. That's not evidence of anything.
+- **Experiments 2 and 3 (genome ocean, learned mutation) are shelved, not rerun**
+  (2026-10-16, agreed with the owner). An audit found reasons why their verdict on this
+  build would mean little:
+  - **Ocean reward is mostly lost.** Score is paid at the next epoch's payout, and only if
+    the mother is still alive.
+  - **The 4-op learner can't beat a constant guess.** See the ceilings below.
+  - **Learned mutation has a confound.** It often writes the op being copied, which lowers
+    its effective mutation rate below the control's.
+  - **The genome ocean may reward homogeneity.**
+
+  Their configs stay in "Rerun the experiments" below, in case a fixed baseline makes them
+  worth judging.
+- **Ocean ceilings** (`scripts/ceiling.py`, bits per guess above the best constant guess,
+  20 MB samples):
+
+  | Ocean | 4-op learner | Order-1 best | Order-2 | Order-3 |
+  |---|---|---|---|---|
+  | enwik8 | +0.01 | +0.40 | +0.66 | +1.00 |
+  | text8 | −0.21 | +0.24 | +0.32 | +0.71 |
+  | wikiprose | −0.16 | +0.29 | +0.35 | +0.71 |
+
+  - Live creatures score about 1.2 bits/guess, below the constant guess (1.6).
+  - Learning is invisible to selection until memory allows order-2 contexts (64 KB).
+  - `oceans/wikiprose` is enwik8 with markup stripped (`scripts/strip_wiki.py`, sha1
+    `230a99c960345028ae0e4acbde8878db2092d55a`).
+- **Gene-level meter** (`src/genes.rs`, census columns `gene_*`). It applies Channon's test
+  with genes as components, as in Geb, which is the only system to pass the test.
+  - Genes are code between labels, counted once executed.
+  - A null shadow (`gene_null_new`) measures how many genes chance alone marks
+    significant.
+  - At 1,500 epochs, real significant genes outnumber null ones about 65:1.
+  - Caveat: the world is asexual, so every gene in a winning genome hitchhikes. The gene
+    count overstates how many distinct adaptations there are.
+  - `compare` prints a gene-level verdict next to the genotype one. **Which of the two is
+    the official rule is the owner's call, and must be fixed before the next batch.**
+- **Plan from here** (agreed 2026-10-16; the owner gates each step):
+  1. Baseline v4: score paid at divide, no free bits, random ocean start, ocean chosen
+     from the ceilings.
+  2. Fast screening: small and short, then confirm long.
+  3. Then, one at a time:
+     - lift the predictor cap (memory, reading soup cells);
+     - frequency-dependent ocean income;
+     - reef v2, with involuntary emission and mixed cooperation and competition;
+     - constructor mode last.
 - **Stop rule** (agreed with the owner): if experiments 1–3 all fail, stop adding mechanisms
   and rethink the substrate. The candidate is constructor mode (`docs/constructor.md`):
   - von Neumann's tape-and-constructor design;
@@ -32,7 +69,7 @@ to Linux.
 
 ```
 cargo build --release
-mkdir -p oceans && cd oceans && curl -O http://mattmahoney.net/dc/enwik8.zip && unzip enwik8.zip && cd ..
+mkdir -p oceans && cd oceans && curl -LO https://mattmahoney.net/dc/enwik8.zip && unzip enwik8.zip && cd ..
 sha1sum oceans/enwik8        # 57b8363b814821dc9d47aa4d41f58733519076b2
 nohup scripts/queue.sh "LB_base=--no-tasks --ocean oceans/enwik8|GO_gen=--no-tasks --ocean genomes|LM_learn=--no-tasks --ocean oceans/enwik8 --learned-mut 25" V3_DONE &
 # check the settings took, right after launch (a launch bug once silently dropped the ocean):
@@ -42,9 +79,13 @@ target/release/abiogenesis compare runs/GO_gen runs/LB_base
 target/release/abiogenesis compare runs/LM_learn runs/LB_base
 ```
 
-Cost: 30 runs × 20,000 epochs. On the 16-thread Windows PC, 12 at a time ran about
-140 epochs/min per world once populations reached about 3,000. Budget roughly 5–6 hours
-there; scale by core count. `queue.sh` defaults to 3/4 of the threads (`MAX=` to change).
+Cost: 30 runs × 20,000 epochs.
+- On the 16-thread Windows PC, 12 at a time ran about 140 epochs/min per world, roughly
+  5–6 hours a batch.
+- On this Linux machine a single world runs the whole 20,000 epochs in about 20 minutes,
+  1,000 epochs/min at population 3,300 (measured 2026-10-16). Expect a batch in about 2
+  hours.
+- `queue.sh` defaults to 3/4 of the threads (`MAX=` to change).
 
 **Check this build matches the Windows build** (seed 1, 100 epochs, epoch-99 line of
 `chain.log`):

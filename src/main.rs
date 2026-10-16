@@ -4,6 +4,7 @@ mod meter;
 mod modes;
 mod analyze;
 mod channon;
+mod genes;
 mod prof;
 mod report;
 mod rng;
@@ -186,7 +187,7 @@ fn simulate(
     };
     let mut chain = Vec::new();
     if let Some(s) = sinks.as_mut().filter(|_| !resumed) {
-        writeln!(s.census, "epoch,instr,pop,diversity,size_classes,mean_size,min_size,max_size,mean_activity,new_activity,shadow_diversity,shadow_new_activity,excess,births,deaths,sun_center,sun_half,cosmic_interval,goal,computing,mean_merit,task_not,task_nand,task_and,task_orn,task_or,task_andn,task_nor,task_xor,task_equ,task_echo,scratch,mother_scratch,lost_resize,lost_indel,lost_point,gained,resized_births,divers,ocean_acc,ocean_best,ocean_bits,modes_change,modes_novelty,modes_complexity,modes_ecology,observer_bits,infections,reef_emits,reef_reads,kin_reads,norm_cum,norm_median,norm_new,pool,ledger_gap,gini,top_share,rent,evictions,enclosures,revolts_won,revolts_lost,gifts,gifted,titled,mean_levy,matings,lessons,joins,groups,largest_group,died_old,died_starved,died_reaped,dominant").ok();
+        writeln!(s.census, "epoch,instr,pop,diversity,size_classes,mean_size,min_size,max_size,mean_activity,new_activity,shadow_diversity,shadow_new_activity,excess,births,deaths,sun_center,sun_half,cosmic_interval,goal,computing,mean_merit,task_not,task_nand,task_and,task_orn,task_or,task_andn,task_nor,task_xor,task_equ,task_echo,scratch,mother_scratch,lost_resize,lost_indel,lost_point,gained,resized_births,divers,ocean_acc,ocean_best,ocean_bits,modes_change,modes_novelty,modes_complexity,modes_ecology,observer_bits,infections,reef_emits,reef_reads,kin_reads,norm_cum,norm_median,norm_new,pool,ledger_gap,gini,top_share,rent,evictions,enclosures,revolts_won,revolts_lost,gifts,gifted,titled,mean_levy,matings,lessons,joins,groups,largest_group,died_old,died_starved,died_reaped,gene_alive,gene_cum,gene_median,gene_new,gene_null_new,dominant").ok();
     }
     let t0 = Instant::now();
     for e in e0..cfg.epochs {
@@ -245,13 +246,13 @@ fn simulate(
             let wx = w.weather;
             writeln!(
                 s.census,
-                "{e},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{:.2},{:.2},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{:.2},{:.3},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{}",
+                "{e},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{:.2},{:.2},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{:.2},{:.3},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 w.instr, c.pop, c.diversity, c.size_classes, c.mean_size, c.min_size, c.max_size, c.mean_activity,
                 c.new_activity, c.shadow_diversity, c.shadow_new_activity, c.excess, c.births, c.deaths,
                 wx.sun_center, wx.sun_half, wx.cosmic_interval, wx.goal, c.computing, c.mean_merit,
                 c.tasks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
                 c.scratch, c.stats.mother_nopx as f64 / c.stats.births.max(1) as f64, c.stats.lost_resize, c.stats.lost_indel,
-                c.stats.lost_point, c.stats.gained, c.stats.resized, c.divers, c.ocean_acc, c.ocean_best, c.ocean_bits, c.modes.change, c.modes.novelty, c.modes.complexity, c.modes.ecology, c.modes.observer_bits, c.stats.infections, c.stats.emits, c.stats.reef_reads, c.stats.kin_reads, c.norm.cum, c.norm.median, c.norm.new, w.pool, gap, gini, top, c.stats.rent, c.stats.evictions, c.stats.enclosures, c.stats.revolts_won, c.stats.revolts_lost, c.stats.gifts, c.stats.gifted, titled.0, titled.1, c.stats.matings, c.stats.lessons, c.stats.joins, groups.0, groups.1, c.stats.died_old, c.stats.died_starved, c.stats.died_reaped, c.dominant
+                c.stats.lost_point, c.stats.gained, c.stats.resized, c.divers, c.ocean_acc, c.ocean_best, c.ocean_bits, c.modes.change, c.modes.novelty, c.modes.complexity, c.modes.ecology, c.modes.observer_bits, c.stats.infections, c.stats.emits, c.stats.reef_reads, c.stats.kin_reads, c.norm.cum, c.norm.median, c.norm.new, w.pool, gap, gini, top, c.stats.rent, c.stats.evictions, c.stats.enclosures, c.stats.revolts_won, c.stats.revolts_lost, c.stats.gifts, c.stats.gifted, titled.0, titled.1, c.stats.matings, c.stats.lessons, c.stats.joins, groups.0, groups.1, c.stats.died_old, c.stats.died_starved, c.stats.died_reaped, c.genes.alive, c.genes.cum, c.genes.median, c.genes.new, c.genes.null_new, c.dominant
             )
             .ok();
             writeln!(s.feed, "{e} {}", hex(&fb)).ok();
