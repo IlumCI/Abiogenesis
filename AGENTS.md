@@ -114,6 +114,22 @@ to Linux.
     `--v4` keeps the per-cycle floor.
   - Lesson: before closing an exploit, ask whether it feeds novelty. Close exploits of
     the measurement; test exploits of the ecology. The owner raised this on 2026-10-16.
+- **Experiment 6, horizontal transfer** (`--hgt` on the memory arm, 10 × 20k, control =
+  experiment 4's memory arm): **FAIL**, 0/10 on genes, 3/10 on genotypes.
+  - **The first signal against decay:** second-half new genes exceeded the first half in
+    5/10 worlds (for example 9.4k → 25.9k), against 0/10 for the control.
+  - It failed because those worlds' cumulative activity stayed below the control's.
+  - **Being confirmed** on fresh seeds 11–13 × 100k, with matching controls
+    (`LONG_h_*`, `LONG_c_*`).
+- **All cheats allowed** (`--free-copy --hgt`, the owner's request, 2026-10-16):
+  - With no copy rule, all 10 screened worlds died of error catastrophe between epoch 43
+    and 1,071. Heredity never formed.
+  - With `--birth-cost 10` (a child's body costs energy per cell, so corner-cutting is
+    priced, not banned), all 5 screened worlds survived 2,000 epochs. K=30 starved them.
+  - `FREE2_1` (100k) is alive, but nearly every creature is a unique genotype.
+- **Speed (2026-10-17):** 17–26% less CPU per run, results identical.
+  `scripts/equiv.sh` compares the chains of 8 configurations between two binaries;
+  every speed change must pass it.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):
   1. ~~Baseline v4~~ (done).
   2. Fast screening: small and short, then confirm long.
