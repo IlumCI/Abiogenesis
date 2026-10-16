@@ -103,6 +103,10 @@ pub struct Params {
     /// floored, so guessing worse than a constant guess can't pay off as a lottery on its
     /// lucky cycles. Part of `--v4` since 2026-10-16; older v4 runs have it off.
     pub debt: bool,
+    /// Horizontal transfer (lean): a child cell may be copied from another living
+    /// creature's body, not only the mother's. Free cells and child blocks still don't
+    /// count, so junk-filled children stay impossible.
+    pub hgt: bool,
 }
 
 /// Size of the order-2 memory, and where a two-byte context lands in it.
@@ -166,6 +170,7 @@ impl Default for Params {
             mem2: false,
             streams: 0,
             debt: false,
+            hgt: false,
         }
     }
 }
@@ -1062,6 +1067,16 @@ impl World {
 
     /// Mark cells as owned. `occ` mirrors `owner` one bit per cell so free space can be
     /// scanned 64 cells at a time.
+    /// Whether cell `a` is inside the body (not the child block) of a living creature other
+    /// than the one in `slot`.
+    fn in_other_body(&self, a: u32, slot: usize) -> bool {
+        let o = self.owner[a as usize] as usize;
+        o != 0 && o - 1 != slot && {
+            let d = &self.cs[o - 1];
+            d.alive && a >= d.start && a < d.start + d.size
+        }
+    }
+
     fn claim(&mut self, start: u32, size: u32, slot: usize) {
         for a in start..start + size {
             self.owner[a as usize] = slot as u32 + 1;
@@ -1501,7 +1516,7 @@ impl World {
                         // second half as junk, with the same effect.
                         if !self.p.lean {
                             c.child_writes += 1;
-                        } else if mine(c.bx & self.mask) {
+                        } else if mine(c.bx & self.mask) || (self.p.hgt && self.in_other_body(c.bx & self.mask, slot)) {
                             let i = c.child.map_or(usize::MAX, |(s, _)| dst.wrapping_sub(s) as usize);
                             if i >= 512 || c.child_seen[i / 64] >> (i % 64) & 1 == 0 {
                                 if i < 512 {
