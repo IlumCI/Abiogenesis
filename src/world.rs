@@ -107,6 +107,10 @@ pub struct Params {
     /// creature's body, not only the mother's. Free cells and child blocks still don't
     /// count, so junk-filled children stay impossible.
     pub hgt: bool,
+    /// No copy rule at all: a creature may divide whenever it has a child block, and the
+    /// child is whatever the block holds. Every copy "cheat" (junk padding, skipped cells,
+    /// copying from anywhere) is allowed; heredity is up to the creatures.
+    pub free_copy: bool,
 }
 
 /// Size of the order-2 memory, and where a two-byte context lands in it.
@@ -171,6 +175,7 @@ impl Default for Params {
             streams: 0,
             debt: false,
             hgt: false,
+            free_copy: false,
         }
     }
 }
@@ -1699,7 +1704,13 @@ impl World {
         // Lean: every cell. With 1/8 slack, lineages learned to skip copying their last
         // eighth (9% faster), so each child kept different leftover junk there, every birth
         // was a new genotype, and the novelty measure read zero.
-        let need = if self.p.lean { z } else { z - z / 8 };
+        let need = if self.p.free_copy {
+            0
+        } else if self.p.lean {
+            z
+        } else {
+            z - z / 8
+        };
         if c.child_writes < need {
             self.error(c, slot);
             return;
