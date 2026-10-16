@@ -126,7 +126,17 @@ to Linux.
     and 1,071. Heredity never formed.
   - With `--birth-cost 10` (a child's body costs energy per cell, so corner-cutting is
     priced, not banned), all 5 screened worlds survived 2,000 epochs. K=30 starved them.
-  - `FREE2_1` (100k) is alive, but nearly every creature is a unique genotype.
+  - `FREE2_1` (100k, K=10) went extinct at epoch 13,729; nearly every creature was a
+    unique genotype throughout.
+- **v5 ecology** (`--v5` = `--predation --local --sex --reap-poor`, from the literature
+  review in `docs/research-oee.md`; the owner chose to test the bundle first, then take
+  pieces out one at a time):
+  - **Screen** (5 × 3k, on top of memory + transfer):
+    - predation evolved by itself, and in some worlds it became the main cause of death;
+    - all 5 worlds survived, with predator–prey swings down to 13–35 creatures;
+    - second-half new genes beat the first half in 5/5 (the same world without v5: 2/5),
+      at 2–4× the count, and 60–120× chance.
+  - **The official 10 × 20k test** (`L11_v5` vs `L10_h`) is running.
 - **Speed (2026-10-17):** 17–26% less CPU per run, results identical.
   `scripts/equiv.sh` compares the chains of 8 configurations between two binaries;
   every speed change must pass it.
