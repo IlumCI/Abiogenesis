@@ -22,7 +22,7 @@ use world::{Params, World};
 
 const USAGE: &str = "abiogenesis
 
-  run     [--out DIR] [--epochs N] [--epoch-instr N] [--seed N] [--soup-bits N] [--feed SPEC] [--sun-bonus N] [--indel N] [--no-tasks] [--ancestor FILE.tasm] [--ocean FILE|genomes] [--ocean-div N] [--max-age N] [--no-memory] [--no-infect] [--reef] [--max-size N] [--economy energy] [--regime feudal|capitalist|evolved] [--social] [--all-ops] [--learned-mut PCT] [--v4] [--mem2] [--energy-total N]
+  run     [--out DIR] [--epochs N] [--epoch-instr N] [--seed N] [--soup-bits N] [--feed SPEC] [--sun-bonus N] [--indel N] [--no-tasks] [--ancestor FILE.tasm] [--ocean FILE|genomes] [--ocean-div N] [--max-age N] [--no-memory] [--no-infect] [--reef] [--max-size N] [--economy energy] [--regime feudal|capitalist|evolved] [--social] [--all-ops] [--learned-mut PCT] [--v4] [--mem2] [--energy-total N] [--streams K]
   serve   DIR [run options] [--snapshot-every N]   run forever, resumable
   islands N [run options] [--migrate-every E] [--migrate-count K]
   verify  DIR       replay a run from its seed and feed, check every epoch hash
@@ -53,10 +53,10 @@ impl Config {
     fn to_text(&self) -> String {
         let p = &self.p;
         format!(
-            "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nops={}\n",
+            "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nstreams={}\nops={}\n",
             self.seed, self.epochs, self.epoch_instr, self.warmup, self.feed, p.soup_bits, p.copy_error,
             p.cosmic_base, p.fill, p.min_size, p.max_size, p.search_limit, p.sun_bonus, p.tasks as u8, p.indel, p.max_merit, p.max_age, self.ocean, ocean_hash(&self.ocean), p.ocean_div, p.ocean_cap, p.memory as u8, p.infect as u8, p.infect_radius, p.reef as u8, self.migrate_every, self.migrate_count, p.energy as u8, p.energy_total, match p.regime { world::Regime::Commons => 0, world::Regime::Feudal => 1, world::Regime::Capitalist => 2, world::Regime::Evolved => 3 },
-            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8,
+            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams,
             world::alphabet(p, !self.ocean.is_empty()).iter().map(|&o| isa::NAMES[o as usize]).collect::<Vec<_>>().join(" ")
         )
     }
@@ -104,6 +104,7 @@ impl Config {
                 learned_mut: num("learned_mut").unwrap_or(0) as u32,
                 v4: num("v4").map(|v| v != 0).unwrap_or(false),
                 mem2: num("mem2").map(|v| v != 0).unwrap_or(false),
+                streams: num("streams").unwrap_or(0) as u32,
             },
         })
     }
@@ -189,7 +190,7 @@ fn simulate(
     };
     let mut chain = Vec::new();
     if let Some(s) = sinks.as_mut().filter(|_| !resumed) {
-        writeln!(s.census, "epoch,instr,pop,diversity,size_classes,mean_size,min_size,max_size,mean_activity,new_activity,shadow_diversity,shadow_new_activity,excess,births,deaths,sun_center,sun_half,cosmic_interval,goal,computing,mean_merit,task_not,task_nand,task_and,task_orn,task_or,task_andn,task_nor,task_xor,task_equ,task_echo,scratch,mother_scratch,lost_resize,lost_indel,lost_point,gained,resized_births,divers,ocean_acc,ocean_best,ocean_bits,modes_change,modes_novelty,modes_complexity,modes_ecology,observer_bits,infections,reef_emits,reef_reads,kin_reads,norm_cum,norm_median,norm_new,pool,ledger_gap,gini,top_share,rent,evictions,enclosures,revolts_won,revolts_lost,gifts,gifted,titled,mean_levy,matings,lessons,joins,groups,largest_group,died_old,died_starved,died_reaped,gene_alive,gene_cum,gene_median,gene_new,gene_null_new,dominant").ok();
+        writeln!(s.census, "epoch,instr,pop,diversity,size_classes,mean_size,min_size,max_size,mean_activity,new_activity,shadow_diversity,shadow_new_activity,excess,births,deaths,sun_center,sun_half,cosmic_interval,goal,computing,mean_merit,task_not,task_nand,task_and,task_orn,task_or,task_andn,task_nor,task_xor,task_equ,task_echo,scratch,mother_scratch,lost_resize,lost_indel,lost_point,gained,resized_births,divers,ocean_acc,ocean_best,ocean_bits,modes_change,modes_novelty,modes_complexity,modes_ecology,observer_bits,infections,reef_emits,reef_reads,kin_reads,norm_cum,norm_median,norm_new,pool,ledger_gap,gini,top_share,rent,evictions,enclosures,revolts_won,revolts_lost,gifts,gifted,titled,mean_levy,matings,lessons,joins,groups,largest_group,died_old,died_starved,died_reaped,gene_alive,gene_cum,gene_median,gene_new,gene_null_new,streams_used,dominant").ok();
     }
     let t0 = Instant::now();
     for e in e0..cfg.epochs {
@@ -248,13 +249,13 @@ fn simulate(
             let wx = w.weather;
             writeln!(
                 s.census,
-                "{e},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{:.2},{:.2},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{:.2},{:.3},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{e},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{:.2},{:.2},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{:.2},{:.3},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 w.instr, c.pop, c.diversity, c.size_classes, c.mean_size, c.min_size, c.max_size, c.mean_activity,
                 c.new_activity, c.shadow_diversity, c.shadow_new_activity, c.excess, c.births, c.deaths,
                 wx.sun_center, wx.sun_half, wx.cosmic_interval, wx.goal, c.computing, c.mean_merit,
                 c.tasks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
                 c.scratch, c.stats.mother_nopx as f64 / c.stats.births.max(1) as f64, c.stats.lost_resize, c.stats.lost_indel,
-                c.stats.lost_point, c.stats.gained, c.stats.resized, c.divers, c.ocean_acc, c.ocean_best, c.ocean_bits, c.modes.change, c.modes.novelty, c.modes.complexity, c.modes.ecology, c.modes.observer_bits, c.stats.infections, c.stats.emits, c.stats.reef_reads, c.stats.kin_reads, c.norm.cum, c.norm.median, c.norm.new, w.pool, gap, gini, top, c.stats.rent, c.stats.evictions, c.stats.enclosures, c.stats.revolts_won, c.stats.revolts_lost, c.stats.gifts, c.stats.gifted, titled.0, titled.1, c.stats.matings, c.stats.lessons, c.stats.joins, groups.0, groups.1, c.stats.died_old, c.stats.died_starved, c.stats.died_reaped, c.genes.alive, c.genes.cum, c.genes.median, c.genes.new, c.genes.null_new, c.dominant
+                c.stats.lost_point, c.stats.gained, c.stats.resized, c.divers, c.ocean_acc, c.ocean_best, c.ocean_bits, c.modes.change, c.modes.novelty, c.modes.complexity, c.modes.ecology, c.modes.observer_bits, c.stats.infections, c.stats.emits, c.stats.reef_reads, c.stats.kin_reads, c.norm.cum, c.norm.median, c.norm.new, w.pool, gap, gini, top, c.stats.rent, c.stats.evictions, c.stats.enclosures, c.stats.revolts_won, c.stats.revolts_lost, c.stats.gifts, c.stats.gifted, titled.0, titled.1, c.stats.matings, c.stats.lessons, c.stats.joins, groups.0, groups.1, c.stats.died_old, c.stats.died_starved, c.stats.died_reaped, c.genes.alive, c.genes.cum, c.genes.median, c.genes.new, c.genes.null_new, w.streams_used(), c.dominant
             )
             .ok();
             writeln!(s.feed, "{e} {}", hex(&fb)).ok();
@@ -448,6 +449,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
     p.v4 = args.iter().any(|a| a == "--v4");
     p.mem2 = args.iter().any(|a| a == "--mem2");
     p.energy_total = num("--energy-total", p.energy_total)?;
+    p.streams = num("--streams", 0)?.min(256) as u32;
     p.energy = arg_val(args, "--economy") == Some("energy");
     p.regime = match arg_val(args, "--regime") {
         Some("feudal") => world::Regime::Feudal,

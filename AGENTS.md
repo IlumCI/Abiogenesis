@@ -88,8 +88,10 @@ to Linux.
     half is below half the first in 3 of 10 pairs. The plateau moved up; it didn't go away.
   - **The learner evolved and lasted in 4 of 10 worlds** (about 1,900–2,400 divers at the
     end), and in 1 of 10 controls.
-  - **Seed 3 reached +1.31 bits/guess.** That's above anything order-2 can reach offline
-    (+0.74 in-sample), so suspect a fifth cheat (Lessons) until it's explained.
+  - Seed 3's final census read +1.31 bits/guess, but that's not a cheat. Averaged over
+    every census with more than 500 divers, it gets +0.14 (sd 0.40). Lineages inherit
+    their ocean position and read in lockstep, so one census is about one sample. Real
+    learner averages are +0.14 to +0.28, well under the +0.62 reachable offline.
   - The 3,000-epoch screen had said 9/10 on genotypes. Short screens overrate early
     bursts.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):

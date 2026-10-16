@@ -93,6 +93,12 @@ pub struct Params {
     /// Order-2 memory: `dive` leaves two-byte contexts in dx and cx, and `load`/`store` index
     /// a 4 KB memory by a hash of them, so the 4-op learner predicts from the last two bytes.
     pub mem2: bool,
+    /// Frequency-dependent ocean (v4 + energy): the ocean is cut into this many streams,
+    /// each XORed with its own key so what is learned in one is useless in another. Each
+    /// pays a fixed share of the score budget, priced by how much was scored there last
+    /// epoch, so a crowded stream pays little and an empty one a lot. One child in 16
+    /// moves to a random stream. 0 = off.
+    pub streams: u32,
 }
 
 /// Size of the order-2 memory, and where a two-byte context lands in it.
@@ -154,6 +160,7 @@ impl Default for Params {
             learned_mut: 0,
             v4: false,
             mem2: false,
+            streams: 0,
         }
     }
 }
@@ -362,6 +369,8 @@ pub struct World {
     base_guess: u8,
     score_rate: u64,
     score_earned: u64,
+    stream_rate: Vec<u64>,
+    stream_earned: Vec<u64>,
 }
 
 /// Where scratch (nopx) cells go, per epoch. Reset by the census.
@@ -447,9 +456,33 @@ impl World {
             base_guess: 0,
             score_rate: 0,
             score_earned: 0,
+            stream_rate: vec![0; p.streams as usize],
+            stream_earned: vec![0; p.streams as usize],
             p,
         }
         .with_base_guess()
+    }
+
+    /// Which stream an ocean position lies in, when the ocean is split into streams.
+    fn stream_of(&self, pos: u32) -> Option<usize> {
+        let k = self.stream_rate.len() as u64;
+        let n = self.ocean.len() as u64;
+        (k > 0 && n > 0).then(|| ((pos as u64 % n) * k / n) as usize)
+    }
+
+    fn stream_key(&self, pos: u32) -> u8 {
+        self.stream_of(pos).map(|k| (k as u8).wrapping_mul(157)).unwrap_or(0)
+    }
+
+    /// Streams with at least one creature that guessed there last cycle.
+    pub fn streams_used(&self) -> u32 {
+        let mut seen = vec![false; self.stream_rate.len()];
+        for c in self.cs.iter().filter(|c| c.alive && c.scored_last >= 4) {
+            if let Some(k) = self.stream_of(c.pos) {
+                seen[k] = true;
+            }
+        }
+        seen.iter().filter(|&&b| b).count() as u32
     }
 
     fn with_base_guess(mut self) -> Self {
@@ -602,6 +635,12 @@ impl World {
             let alive = self.cs.iter().filter(|c| c.alive).count() as u64;
             self.score_rate = ((budget / 2) as u128 * 65536 / self.score_earned.max(alive).max(1) as u128) as u64;
             self.score_earned = 0;
+            let k = self.stream_rate.len() as u64;
+            for i in 0..self.stream_rate.len() {
+                let floor = (alive / k).max(1);
+                self.stream_rate[i] = ((budget / 2 / k) as u128 * 65536 / self.stream_earned[i].max(floor) as u128) as u64;
+                self.stream_earned[i] = 0;
+            }
         }
         let mut credit = vec![0u64; self.cs.len()];
         for i in 0..self.cs.len() {
@@ -1489,7 +1528,7 @@ impl World {
                 } else if self.ocean.is_empty() {
                     None
                 } else {
-                    let b = self.ocean[c.pos as usize % self.ocean.len()];
+                    let b = self.ocean[c.pos as usize % self.ocean.len()] ^ self.stream_key(c.pos);
                     c.pos = c.pos.wrapping_add(1);
                     Some((b, None))
                 };
@@ -1512,7 +1551,7 @@ impl World {
                             let s = if self.p.v4 && from.is_none() {
                                 // Bits right beyond what the best constant guess got on this
                                 // byte: blind or constant guessing earns nothing on average.
-                                (self.base_guess ^ b).count_ones() as i32 - (c.guess ^ b).count_ones() as i32
+                                (self.base_guess ^ self.stream_key(c.pos.wrapping_sub(1)) ^ b).count_ones() as i32 - (c.guess ^ b).count_ones() as i32
                             } else {
                                 4 - (c.guess ^ b).count_ones() as i32
                             };
@@ -1690,10 +1729,19 @@ impl World {
         };
         let earned = c.bits.max(0) as u64 + task_pts;
         if self.p.v4 && self.p.energy {
-            let pay = ((earned as u128 * self.score_rate as u128) >> 16).min(self.pool as u128) as u64;
+            let rate = match self.stream_of(c.pos) {
+                Some(k) => {
+                    self.stream_earned[k] += earned;
+                    self.stream_rate[k]
+                }
+                None => {
+                    self.score_earned += earned;
+                    self.score_rate
+                }
+            };
+            let pay = ((earned as u128 * rate as u128) >> 16).min(self.pool as u128) as u64;
             self.pool -= pay;
             c.energy += pay;
-            self.score_earned += earned;
         } else {
             c.score += earned;
         }
@@ -1708,6 +1756,9 @@ impl World {
         // The child swims on from where its mother stopped reading.
         let ch = &mut self.cs[child];
         ch.pos = c.pos;
+        if self.p.streams > 0 && !self.ocean.is_empty() && self.rng.below(16) == 0 {
+            ch.pos = self.rng.below(self.ocean.len() as u64) as u32;
+        }
         ch.hits_last = c.hits;
         ch.scored_last = c.scored;
         ch.bits_last = c.bits;
@@ -1935,6 +1986,9 @@ impl World {
         if self.p.v4 {
             h.update(&self.score_rate.to_le_bytes());
             h.update(&self.score_earned.to_le_bytes());
+            for v in self.stream_rate.iter().chain(&self.stream_earned) {
+                h.update(&v.to_le_bytes());
+            }
         }
         for l in &self.levies {
             h.update(&l.to_le_bytes());
