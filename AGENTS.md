@@ -49,9 +49,19 @@ to Linux.
   - `compare` prints a gene-level verdict next to the genotype one. **The gene verdict is
     official** (fixed 2026-10-16, before any data); the genotype verdict is a secondary
     readout.
+- **Baseline v4** (`--v4`, done 2026-10-16). Every new experiment uses it.
+  - A guess earns the bits it gets beyond the ocean's best constant guess on that byte, so
+    blind or constant guessing earns nothing on average.
+  - Score is paid in energy at divide from the pool, priced each epoch so last epoch's
+    score would use half the budget, and never more than one creature's share per unit.
+  - The founder starts at a random ocean offset.
+  - Ocean: enwik8. Under v4 scoring, its order-1 learner breaks even (−0.006) where prose
+    loses (−0.16), and order-2 pays +0.67, so the path to a better learner has no valley.
+  - **Result:** in 3 × 3,000-epoch screens almost no creature guesses (0–25 divers, against
+    about 1,000 on the old engine). The old ocean reward was the free bits. Novelty is level
+    with the old engine (1/3 pairs either way), and populations are similar.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):
-  1. Baseline v4: score paid at divide, no free bits, random ocean start, ocean chosen
-     from the ceilings.
+  1. ~~Baseline v4~~ (done).
   2. Fast screening: small and short, then confirm long.
   3. Then, one at a time:
      - lift the predictor cap (memory, reading soup cells);
@@ -95,6 +105,7 @@ Cost: 30 runs × 20,000 epochs.
 |---|---|
 | `run --epochs 100 --seed 1 --no-tasks --economy energy --ocean oceans/enwik8` | `192577de66da806e08b2b113f4d51d6c4dd9a7c127eb486597016ecced0edf65` |
 | the same plus `--all-ops --reef` (the pre-lean engine) | `6c829caf0c65f879bccda078046f229e3d4bd7f6cd8e9162699458f02ba6c430` |
+| the first command plus `--v4` | `553537383139090037e4634376cd166b5969706f9207310e667ac4b5742280c9` |
 
 The simulation uses only integer and basic float math, so they should match. If they don't,
 find out why before trusting any comparison with Windows-era results.

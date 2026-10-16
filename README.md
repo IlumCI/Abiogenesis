@@ -21,7 +21,10 @@ Tierra-style world has hit so far. Progress is judged by Channon's shadow-resett
   `guess` declares the next byte, `dive` reads it. Guesses are scored bit by bit (bits right
   minus 4), and every step of better prediction pays. Blind guessing is not quite zero:
   each cycle's total is floored at 0, and a constant guess gets text's shared high bits
-  free (about +1.6 per guess on enwik8; `scripts/ceiling.py`). A
+  free (about +1.6 per guess on enwik8; `scripts/ceiling.py`). `--v4` fixes this: a guess
+  earns only the bits it gets beyond the ocean's best constant guess, so blind or constant
+  guessing earns nothing; the score is paid in energy at divide; and the founder starts at a
+  random place in the sea. A
   child swims on from where its mother stopped, so lineages can't memorize, only learn
   patterns. The file's hash goes in the config; `verify` refuses another sea.
   `--ocean genomes` makes the sea a sample of the living population's own genomes, rebuilt
@@ -79,10 +82,11 @@ Every child was then a "new" genotype, and the novelty measure read zero.
 |---|---|
 | Baseline worlds | Bounded novelty (class 2), the Tierra/Avida plateau |
 | 1. Reef | FAIL (lost every completed pair) |
-| 2. Genome ocean | Running |
-| 3. Learned mutation (`--learned-mut 25`: a quarter of mutations drawn from an order-2 model of genomes that persisted) | Running |
+| 2. Genome ocean | Shelved: confounded on the old baseline (see AGENTS.md) |
+| 3. Learned mutation (`--learned-mut 25`: a quarter of mutations drawn from an order-2 model of genomes that persisted) | Shelved, same reason |
+| Baseline v4 (`--v4`) | Done. Under fair scoring almost no creature guesses: the old ocean reward was free bits |
 
-If 2 and 3 fail too, the next step is a new substrate: von Neumann's
+If the next experiments fail too, the next step is a new substrate: von Neumann's
 description-and-constructor design instead of self-copying. See `docs/constructor.md`.
 
 ## Use

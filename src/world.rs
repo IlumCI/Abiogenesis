@@ -86,6 +86,10 @@ pub struct Params {
     /// Percent of mutations drawn from an order-2 model of genomes that persisted, instead
     /// of uniformly. 0 = off.
     pub learned_mut: u32,
+    /// Baseline v4: a guess earns only the bits it gets beyond the ocean's best constant
+    /// guess, the score is paid in energy at divide (none lost if the mother dies before the
+    /// payout), and the founder starts at a random place in the ocean.
+    pub v4: bool,
 }
 
 /// Bytes of genome in the genome ocean each epoch: about half a typical population.
@@ -138,6 +142,7 @@ impl Default for Params {
             social: false,
             genome_ocean: false,
             learned_mut: 0,
+            v4: false,
         }
     }
 }
@@ -338,6 +343,13 @@ pub struct World {
     /// [(a * 64 + b) * 64 + c]. Empty when off.
     model: Vec<u32>,
     pub model_total: u64,
+    /// v4: the ocean's best constant guess (bitwise majority byte), which guesses are
+    /// scored against; energy paid per unit of score, x2^16, set at each payout; and score
+    /// earned since the last payout.
+    #[serde(skip)]
+    base_guess: u8,
+    score_rate: u64,
+    score_earned: u64,
 }
 
 /// Where scratch (nopx) cells go, per epoch. Reset by the census.
@@ -420,8 +432,31 @@ impl World {
             merit_mean_k: 1000,
             model: if p.learned_mut > 0 { vec![0; 1 << 18] } else { Vec::new() },
             model_total: 0,
+            base_guess: 0,
+            score_rate: 0,
+            score_earned: 0,
             p,
         }
+        .with_base_guess()
+    }
+
+    fn with_base_guess(mut self) -> Self {
+        self.set_base_guess();
+        self
+    }
+
+    fn set_base_guess(&mut self) {
+        if !self.p.v4 || self.ocean.is_empty() {
+            return;
+        }
+        let mut ones = [0u64; 8];
+        for &b in &self.ocean {
+            for (k, o) in ones.iter_mut().enumerate() {
+                *o += (b >> k & 1) as u64;
+            }
+        }
+        let n = self.ocean.len() as u64;
+        self.base_guess = (0..8).fold(0u8, |g, k| g | (((ones[k] * 2 > n) as u8) << k));
     }
 
     /// Weather comes from the feed: where the sun is, how wide, how hard the cosmic rays hit.
@@ -483,6 +518,7 @@ impl World {
 
     pub fn after_load(&mut self, ocean: Vec<u8>) {
         self.ocean = ocean;
+        self.set_base_guess();
         for i in 0..self.cs.len() {
             if !self.cs[i].alive {
                 continue;
@@ -544,7 +580,17 @@ impl World {
         let scores: u128 = self.cs.iter().filter(|c| c.alive).map(|c| c.score as u128).sum();
         let land: u128 = self.cs.iter().filter(|c| c.alive).map(|c| c.size as u128).sum();
         let by_score = if scores > 0 { budget / 2 } else { 0 };
-        let by_land = budget - by_score;
+        let mut by_land = budget - by_score;
+        if self.p.v4 {
+            // Score is paid at divide instead. Half the budget is set aside for it, priced
+            // so last epoch's score would have used it up; the pool covers any overrun. One
+            // unit never buys more than one creature's share, or a lone lucky guess in a
+            // world of non-guessers would take the whole half.
+            by_land = budget - budget / 2;
+            let alive = self.cs.iter().filter(|c| c.alive).count() as u64;
+            self.score_rate = ((budget / 2) as u128 * 65536 / self.score_earned.max(alive).max(1) as u128) as u64;
+            self.score_earned = 0;
+        }
         let mut credit = vec![0u64; self.cs.len()];
         for i in 0..self.cs.len() {
             if !self.cs[i].alive {
@@ -898,6 +944,9 @@ impl World {
         let g = genotype_of(code);
         let slot = self.spawn(at, size, g, 1, 0);
         self.endow(slot, 100_000);
+        if self.p.v4 && !self.ocean.is_empty() {
+            self.cs[slot].pos = self.rng.below(self.ocean.len() as u64) as u32;
+        }
         g
     }
 
@@ -1438,7 +1487,13 @@ impl World {
                         c.dx = c.prev as u32;
                         c.prev = b;
                         if c.has_guess {
-                            let s = 4 - (c.guess ^ b).count_ones() as i32;
+                            let s = if self.p.v4 && from.is_none() {
+                                // Bits right beyond what the best constant guess got on this
+                                // byte: blind or constant guessing earns nothing on average.
+                                (self.base_guess ^ b).count_ones() as i32 - (c.guess ^ b).count_ones() as i32
+                            } else {
+                                4 - (c.guess ^ b).count_ones() as i32
+                            };
                             c.scored += 1;
                             c.hits += (c.guess == b) as u32;
                             c.has_guess = false;
@@ -1611,7 +1666,15 @@ impl World {
         } else {
             0
         };
-        c.score += c.bits.max(0) as u64 + task_pts;
+        let earned = c.bits.max(0) as u64 + task_pts;
+        if self.p.v4 && self.p.energy {
+            let pay = ((earned as u128 * self.score_rate as u128) >> 16).min(self.pool as u128) as u64;
+            self.pool -= pay;
+            c.energy += pay;
+            self.score_earned += earned;
+        } else {
+            c.score += earned;
+        }
         let child = self.spawn(s, z, g, merit, c.tasks_now);
         if self.p.energy {
             // A child starts with half of its mother's energy.
@@ -1846,6 +1909,10 @@ impl World {
         h.update(&self.next_cosmic.to_le_bytes());
         h.update(&[self.weather.goal]);
         h.update(&self.pool.to_le_bytes());
+        if self.p.v4 {
+            h.update(&self.score_rate.to_le_bytes());
+            h.update(&self.score_earned.to_le_bytes());
+        }
         for l in &self.levies {
             h.update(&l.to_le_bytes());
         }
