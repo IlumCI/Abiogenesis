@@ -46,8 +46,9 @@ to Linux.
   - At 1,500 epochs, real significant genes outnumber null ones about 65:1.
   - Caveat: the world is asexual, so every gene in a winning genome hitchhikes. The gene
     count overstates how many distinct adaptations there are.
-  - `compare` prints a gene-level verdict next to the genotype one. **Which of the two is
-    the official rule is the owner's call, and must be fixed before the next batch.**
+  - `compare` prints a gene-level verdict next to the genotype one. **The gene verdict is
+    official** (fixed 2026-10-16, before any data); the genotype verdict is a secondary
+    readout.
 - **Plan from here** (agreed 2026-10-16; the owner gates each step):
   1. Baseline v4: score paid at divide, no free bits, random ocean start, ocean chosen
      from the ceilings.
@@ -102,11 +103,20 @@ find out why before trusting any comparison with Windows-era results.
 
 - **One mechanism per experiment.** Same build for both arms, seeds 1–10, 20,000 epochs,
   `--economy energy --no-tasks`, and the enwik8 ocean unless the ocean is the thing tested.
-- **Win** = `abiogenesis compare` says WIN: at least 8 of 10 pairs where
-  - normalised cumulative activity is still growing (last quarter's mean above the second
+- **Win** = `abiogenesis compare` says `verdict (genes, official): ... WIN`, which needs at
+  least 8 of 10 pairs where, counting genes (`gene_*` columns) as components,
+  - cumulative gene activity is still growing (last quarter's mean above the second
     quarter's) and above the control's;
-  - second-half new significant components are at least half the first half's, and more
-    than the control's.
+  - second-half new significant genes are at least half the first half's, and more than
+    the control's;
+  - second-half new significant genes are at least 10× what the arm's own null shadow
+    marks significant by chance (`gene_null_new`).
+
+  The genotype verdict (`norm_*`) is printed too, as a secondary readout. Fixed
+  2026-10-16, before any data.
+- **Plain-language target** (what counts as breaking the plateau): in a 100,000-epoch
+  run, new significant genes keep appearing at a rate that doesn't fall away, and stay
+  10× above chance.
 - **Read the `!` warnings before the verdict:**
   - *meltdown* (nearly every creature a distinct genotype);
   - *extinct*;

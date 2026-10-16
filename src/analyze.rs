@@ -4,11 +4,16 @@
 //! significant components keep coming (second half at least half the first) and outnumber
 //! B's. Eight wins in ten is a WIN.
 //!
-//! It judges twice when both arms have the columns: on whole genotypes (`norm_*`, the
-//! fixed rule) and on genes (`gene_*`, Channon's own choice of component in Geb).
+//! It judges twice when both arms have the columns: on whole genotypes (`norm_*`, a
+//! secondary readout) and on genes (`gene_*`, Channon's own choice of component in Geb).
+//! The gene verdict is the official one (fixed 2026-10-16, before any data). On genes a
+//! pair also needs A's second-half new genes to be at least `NULL_MARGIN` times what its
+//! null shadow marks significant by chance.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const NULL_MARGIN: u64 = 10;
 
 struct Series {
     epochs: usize,
@@ -18,6 +23,7 @@ struct Series {
     q4_cum: f64,
     new_h1: u64,
     new_h2: u64,
+    null_h2: Option<u64>,
     ledger_bad: bool,
 }
 
@@ -31,15 +37,19 @@ impl Series {
     fn extinct(&self) -> bool {
         self.final_pop == 0
     }
+    fn beats_null(&self) -> bool {
+        self.null_h2.is_none_or(|z| self.new_h2 >= NULL_MARGIN * z.max(1))
+    }
 }
 
-fn load(dir: &Path, cum_col: &str, new_col: &str) -> Result<Series, String> {
+fn load(dir: &Path, cum_col: &str, new_col: &str, null_col: Option<&str>) -> Result<Series, String> {
     let raw = fs::read(dir.join("census.csv")).map_err(|e| format!("{}: {e}", dir.display()))?;
     let text: String = String::from_utf8_lossy(&raw).chars().filter(|&c| c != '\0').collect();
     let mut lines = text.lines();
     let head: Vec<&str> = lines.next().ok_or("empty census")?.split(',').collect();
     let col = |n: &str| head.iter().position(|h| *h == n).ok_or(format!("no column {n}"));
     let (pop, div, cum, new, gap) = (col("pop")?, col("diversity")?, col(cum_col)?, col(new_col)?, col("ledger_gap"));
+    let null = null_col.map(col).transpose()?;
     let rows: Vec<Vec<f64>> = lines
         .map(|l| l.split(',').map(|x| x.parse().unwrap_or(0.0)).collect::<Vec<f64>>())
         .filter(|r| r.len() == head.len())
@@ -59,6 +69,7 @@ fn load(dir: &Path, cum_col: &str, new_col: &str) -> Result<Series, String> {
         q4_cum: mean(3 * n / 4, n),
         new_h1: sum(0, n / 2),
         new_h2: sum(n / 2, n),
+        null_h2: null.map(|z| rows[n / 2..].iter().map(|r| r[z] as u64).sum()),
         ledger_bad: gap.map(|g| rows.iter().any(|r| r[g] != 0.0)).unwrap_or(false),
     })
 }
@@ -89,18 +100,20 @@ fn sign_p(k: usize, n: usize) -> f64 {
 }
 
 pub fn compare(a: &str, b: &str) -> Result<(), String> {
-    judge(a, b, "genotypes", "norm_cum", "norm_new")?;
+    judge(a, b, "genotypes, secondary", "norm_cum", "norm_new", None)?;
     let has_genes = |p: &str| {
         seeds(p).first().and_then(|(_, d)| fs::read_to_string(d.join("census.csv")).ok()).is_some_and(|t| t.lines().next().unwrap_or("").contains("gene_cum"))
     };
     if has_genes(a) && has_genes(b) {
         println!();
-        judge(a, b, "genes", "gene_cum", "gene_new")?;
+        judge(a, b, "genes, official", "gene_cum", "gene_new", Some("gene_null_new"))?;
+    } else {
+        println!("\nno gene columns in both arms: no official verdict (rerun on a build with the gene meter)");
     }
     Ok(())
 }
 
-fn judge(a: &str, b: &str, unit: &str, cum_col: &str, new_col: &str) -> Result<(), String> {
+fn judge(a: &str, b: &str, unit: &str, cum_col: &str, new_col: &str, null_col: Option<&str>) -> Result<(), String> {
     let (sa, sb) = (seeds(a), seeds(b));
     let pairs: Vec<(u64, &PathBuf, &PathBuf)> =
         sa.iter().filter_map(|(s, pa)| sb.iter().find(|(t, _)| t == s).map(|(_, pb)| (*s, pa, pb))).collect();
@@ -112,9 +125,9 @@ fn judge(a: &str, b: &str, unit: &str, cum_col: &str, new_col: &str) -> Result<(
     let mut wins = 0;
     let mut warn = Vec::new();
     for (seed, pa, pb) in &pairs {
-        let (x, y) = (load(pa, cum_col, new_col)?, load(pb, cum_col, new_col)?);
+        let (x, y) = (load(pa, cum_col, new_col, null_col)?, load(pb, cum_col, new_col, null_col)?);
         let grow = x.growing() && x.q4_cum > y.q4_cum;
-        let sust = x.sustained() && x.new_h2 > y.new_h2;
+        let sust = x.sustained() && x.new_h2 > y.new_h2 && x.beats_null();
         let win = grow && sust && !x.extinct();
         wins += win as usize;
         let f = |s: &Series| {
@@ -134,6 +147,9 @@ fn judge(a: &str, b: &str, unit: &str, cum_col: &str, new_col: &str) -> Result<(
             if s.final_pop > 50 && s.final_div * 10 >= s.final_pop * 9 {
                 warn.push(format!("seed {seed} {tag}: {} genotypes in {} creatures (meltdown?)", s.final_div, s.final_pop));
             }
+        }
+        if !x.beats_null() {
+            warn.push(format!("seed {seed} A: second-half new {} under {NULL_MARGIN}x null {}", x.new_h2, x.null_h2.unwrap_or(0)));
         }
         if x.epochs != y.epochs {
             warn.push(format!("seed {seed}: unequal lengths {} vs {}", x.epochs, y.epochs));
