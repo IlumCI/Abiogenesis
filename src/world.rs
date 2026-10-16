@@ -1365,8 +1365,19 @@ impl World {
             // Nothing reads the runner's place in the queue meanwhile: `reap_one(slot)` spares
             // it, and it can't be killed during its own turn.
             let key = c.reap_score;
-            for _ in 0..slice {
-                self.step(&mut c, slot);
+            // Steps that can't trigger the next cosmic ray run without checking for it.
+            let mut left = slice;
+            while left > 0 {
+                let quiet = self.next_cosmic.saturating_sub(self.instr + 1).min(left);
+                for _ in 0..quiet {
+                    self.exec(&mut c, slot);
+                }
+                self.instr += quiet;
+                left -= quiet;
+                if left > 0 {
+                    self.step(&mut c, slot);
+                    left -= 1;
+                }
             }
             if c.reap_score != key {
                 self.reaper.remove(&(key, c.id, slot));
@@ -1517,6 +1528,8 @@ impl World {
         found.map(|r| r.0)
     }
 
+    /// One instruction: fetch it, count it, fire a cosmic ray if one is due, execute. The
+    /// op is fetched before the ray, so a ray landing on it changes the cell, not this step.
     fn step(&mut self, c: &mut Creature, slot: usize) {
         let p = c.ip & self.mask;
         let op = self.soup[p as usize];
@@ -1524,6 +1537,20 @@ impl World {
         if self.instr >= self.next_cosmic {
             self.cosmic_ray(c, slot);
         }
+        self.exec_op(c, slot, p, op);
+    }
+
+    /// `step` for a stretch known to hold no cosmic ray; `run` counts these in bulk.
+    #[inline(always)]
+    fn exec(&mut self, c: &mut Creature, slot: usize) {
+        let p = c.ip & self.mask;
+        let op = self.soup[p as usize];
+        self.exec_op(c, slot, p, op);
+    }
+
+    /// Execute `op`, fetched from `p`. Reads nothing of `instr`.
+    #[inline(always)]
+    fn exec_op(&mut self, c: &mut Creature, slot: usize, p: u32, op: u8) {
         let off = p.wrapping_sub(c.start);
         if off < c.size {
             if off < 512 {
