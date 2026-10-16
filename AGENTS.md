@@ -119,8 +119,20 @@ to Linux.
   - **The first signal against decay:** second-half new genes exceeded the first half in
     5/10 worlds (for example 9.4k → 25.9k), against 0/10 for the control.
   - It failed because those worlds' cumulative activity stayed below the control's.
-  - **Being confirmed** on fresh seeds 11–13 × 100k, with matching controls
-    (`LONG_h_*`, `LONG_c_*`).
+  - **Long runs** on fresh seeds 11–13, with matching controls: stopped by the owner at
+    about epoch 41–47k to free the CPU.
+    - New genes per 10k block, transfer:
+      - seed 11: 7.2 → 5.8 → 2.9 → 4.9k
+      - seed 12: 8.9 → 17.0 → 17.1 → 14.2k
+      - seed 13: 12.9 → 4.7 → 15.4 → 20.2k
+    - Controls:
+      - seed 11: 16.8 → 15.6 → 22.3 → 23.0k
+      - seed 12: 21.5 → 10.0 → 3.1 → 3.6k
+      - seed 13: 7.9 → 5.3 → 4.0 → 2.6k
+    - So 2/3 held for transfer against 1/3 for the controls, all 20–40× chance.
+      Suggestive, not settled.
+    - The no-cheats control `CTL_1` decayed slowly (12.9 → 2.1k per 10k over 60k
+      epochs): the classic plateau.
 - **All cheats allowed** (`--free-copy --hgt`, the owner's request, 2026-10-16):
   - With no copy rule, all 10 screened worlds died of error catastrophe between epoch 43
     and 1,071. Heredity never formed.
