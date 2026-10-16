@@ -166,7 +166,7 @@ function drawSoup(fr) {
     } else {
       [r, gg, b] = hsl(hsh * 360, 0.62, 0.42 + ((hsh * 7.31) % 1) * 0.16);
     }
-    if (flags & 2) { r = r * 0.35 + 166; gg = gg * 0.35 + 166; b = b * 0.35 + 166; }
+    if (flags & 2) { r = r * 0.62 + 92; gg = gg * 0.62 + 92; b = b * 0.62 + 92; }
     else if (flags & 1) { r = r * 0.7 + 50; gg = gg * 0.7 + 60; b = b * 0.7 + 66; }
     if (flags & 4) { r *= 0.8; gg *= 0.8; b *= 0.8; }
     const px = 0xff000000 | (Math.min(255, b) << 16) | (Math.min(255, gg) << 8) | Math.min(255, r);
@@ -324,8 +324,8 @@ function render(fr, rows, label) {
     }
     text("one colour per genotype: a spreading patch is a clone taking over", lx, ly + 34, `14px ${FONT.body}`, COL.muted);
   }
-  g.fillStyle = "rgb(230,240,244)"; g.fillRect(lx + 470, ly, 24, 12);
-  text("predicting the next byte now", lx + 504, ly + 11, `14px ${FONT.body}`, COL.muted);
+  g.fillStyle = "rgb(190,200,205)"; g.fillRect(lx + 470, ly, 24, 12);
+  text("brighter: predicting the next byte now", lx + 504, ly + 11, `14px ${FONT.body}`, COL.muted);
   text("each row: 512 cells of memory", lx + 504, ly + 34, `14px ${FONT.body}`, COL.muted);
 }
 
