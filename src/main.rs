@@ -57,7 +57,7 @@ impl Config {
             "seed={}\nepochs={}\nepoch_instr={}\nwarmup={}\nfeed={}\nsoup_bits={}\ncopy_error={}\ncosmic_base={}\nfill={}\nmin_size={}\nmax_size={}\nsearch_limit={}\nsun_bonus={}\ntasks={}\nindel={}\nmax_merit={}\nmax_age={}\nocean={}\nocean_hash={}\nocean_div={}\nocean_cap={}\nmemory={}\ninfect={}\ninfect_radius={}\nreef={}\nmigrate_every={}\nmigrate_count={}\nenergy={}\nenergy_total={}\nregime={}\nlean={}\nsocial={}\nlearned_mut={}\nv4={}\nmem2={}\nstreams={}\ndebt={}\nhgt={}\nfree_copy={}\nbirth_cost={}\npredation={}\nlocal={}\nsex={}\nreap_poor={}\nradius={}\nops={}\n",
             self.seed, self.epochs, self.epoch_instr, self.warmup, self.feed, p.soup_bits, p.copy_error,
             p.cosmic_base, p.fill, p.min_size, p.max_size, p.search_limit, p.sun_bonus, p.tasks as u8, p.indel, p.max_merit, p.max_age, self.ocean, ocean_hash(&self.ocean), p.ocean_div, p.ocean_cap, p.memory as u8, p.infect as u8, p.infect_radius, p.reef as u8, self.migrate_every, self.migrate_count, p.energy as u8, p.energy_total, match p.regime { world::Regime::Commons => 0, world::Regime::Feudal => 1, world::Regime::Capitalist => 2, world::Regime::Evolved => 3 },
-            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams, p.debt as u8, p.hgt as u8, p.free_copy as u8, p.birth_cost, p.predation as u8, p.local as u8, p.sex as u8, p.reap_poor as u8, p.radius,
+            p.lean as u8, p.social as u8, p.learned_mut, p.v4 as u8, p.mem2 as u8, p.streams, p.debt as u8, p.hgt as u8, p.free_copy as u8, p.birth_cost, p.predation as u8, p.local, p.sex as u8, p.reap_poor as u8, p.radius,
             world::alphabet(p, !self.ocean.is_empty()).iter().map(|&o| isa::NAMES[o as usize]).collect::<Vec<_>>().join(" ")
         )
     }
@@ -111,7 +111,7 @@ impl Config {
                 free_copy: num("free_copy").map(|v| v != 0).unwrap_or(false),
                 birth_cost: num("birth_cost").unwrap_or(0),
                 predation: num("predation").map(|v| v != 0).unwrap_or(false),
-                local: num("local").map(|v| v != 0).unwrap_or(false),
+                local: num("local").unwrap_or(0).min(2) as u8,
                 sex: num("sex").map(|v| v != 0).unwrap_or(false),
                 reap_poor: num("reap_poor").map(|v| v != 0).unwrap_or(false),
                 radius: num("radius").unwrap_or(1024) as u32,
@@ -467,7 +467,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
     p.birth_cost = num("--birth-cost", 0)?;
     let v5 = args.iter().any(|a| a == "--v5");
     p.predation = v5 || args.iter().any(|a| a == "--predation");
-    p.local = v5 || args.iter().any(|a| a == "--local");
+    p.local = if v5 || args.iter().any(|a| a == "--local") { 2 } else { 0 };
     p.sex = v5 || args.iter().any(|a| a == "--sex");
     p.reap_poor = v5 || args.iter().any(|a| a == "--reap-poor");
     p.radius = num("--radius", 1024)?.clamp(16, 1 << 20) as u32;

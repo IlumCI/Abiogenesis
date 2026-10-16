@@ -136,7 +136,19 @@ to Linux.
     - all 5 worlds survived, with predator–prey swings down to 13–35 creatures;
     - second-half new genes beat the first half in 5/5 (the same world without v5: 2/5),
       at 2–4× the count, and 60–120× chance.
-  - **The official 10 × 20k test** (`L11_v5` vs `L10_h`) is running.
+  - **The official 10 × 20k test** (`L11_v5` vs `L10_h`): **FAIL**, 2/10 on genes, 2/10 on
+    genotypes.
+    - New significant genes kept coming: 3–15× the control, sustained in 7/10, and more
+      than 10× chance.
+    - But cumulative gene activity grew, and beat the control, in only 4/10. Genes turn
+      over rather than accumulate.
+    - 2 worlds went extinct: seed 8 at epoch 10 and seed 7 at epoch 16k.
+    - The "meltdown?" warnings are expected under obligatory sex, where every child is a
+      new genotype. Only the gene verdict means anything there.
+  - **Fix: `local=2`** (now what `--v5` sets) looks 1, 4 and 16 radii out before reaping.
+    With `local=1`, seed 8's founding colony filled its patch and killed its own kin.
+  - **Rerun** as `L12_v5`, plus `L12_ns` without sex (the suspect for turnover without
+    accumulation).
 - **Speed (2026-10-17):** 17–26% less CPU per run, results identical.
   `scripts/equiv.sh` compares the chains of 8 configurations between two binaries;
   every speed change must pass it.

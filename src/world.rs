@@ -122,7 +122,9 @@ pub struct Params {
     /// surface (first SURFACE cells), taking all its energy; one kill per cycle.
     pub predation: bool,
     /// Local world: children go near the mother, and room is made by reaping a neighbour.
-    pub local: bool,
+    /// 1: only within `radius` (a founding colony could fill its patch and kill its own
+    /// kin while empty soup lay beyond); 2: look 1, 4 and 16 radii out before reaping.
+    pub local: u8,
     /// Every child crosses over with the nearest creature of about its size (within 1/8).
     pub sex: bool,
     /// The neighbour reaped for room is the poorest, not the oldest.
@@ -206,7 +208,7 @@ impl Default for Params {
             free_copy: false,
             birth_cost: 0,
             predation: false,
-            local: false,
+            local: 0,
             sex: false,
             reap_poor: false,
             radius: 1024,
@@ -1839,7 +1841,7 @@ impl World {
         c.child_writes = 0;
         c.child_seen = [0; 8];
         let need = size + self.slack();
-        if self.p.local {
+        if self.p.local > 0 {
             self.mal_local(c, slot, size, need);
             return;
         }
@@ -2175,13 +2177,17 @@ impl World {
     fn mal_local(&mut self, c: &mut Creature, slot: usize, size: u32, need: u32) {
         let r = self.p.radius;
         let target = (c.start as i64 + (c.dx as i32 as i64) * 16).rem_euclid(self.n as i64) as u32;
+        let widths: &[u32] = if self.p.local >= 2 { &[1, 4, 16] } else { &[1] };
         for _ in 0..8 {
-            if let Some(a) = self.find_free(target.wrapping_sub(r) & self.mask, need, 2 * r) {
-                self.claim(a, need, slot);
-                self.used += need as u64;
-                c.child = Some((a, size));
-                c.ax = a;
-                return;
+            for &m in widths {
+                let w = (r * m).min(self.n / 2);
+                if let Some(a) = self.find_free(target.wrapping_sub(w) & self.mask, need, 2 * w) {
+                    self.claim(a, need, slot);
+                    self.used += need as u64;
+                    c.child = Some((a, size));
+                    c.ax = a;
+                    return;
+                }
             }
             let ns = self.neighbours(target, r, slot);
             let key = |v: usize| {
