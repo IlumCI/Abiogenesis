@@ -295,6 +295,20 @@ find out why before trusting any comparison with Windows-era results.
 - Too many simulations plus a build crashed the Windows PC. Run batches niced, at most about
   3/4 of the threads, and don't build in the same tree while a heavy batch runs (`queue.sh`
   freezes a copy of the binary).
+- **What limits speed here** (measured 2026-10-17, v5.1 config, MSI GF63 laptop, i7-12650H
+  with 6 performance and 4 efficiency cores):
+  - **A v5.1 world** runs about 43 ms per epoch on its own, about 19 ns per instruction.
+    Time splits as: allocation (`mal` and its free-space search) 26%, census 7%, template
+    search 7%, state hash 6%.
+  - **Build tuning gains nothing** (LTO, a single codegen unit, native CPU, PGO, mimalloc):
+    every variant was within ±5% of the default, and chains were identical.
+  - **Throughput saturates.** Worlds × epochs per second: 48 for 1 world, 141 for 4, 181
+    for 8, 211 for 12, 213 for 16. So 8 worlds give 85% of the 12-world throughput.
+  - **The cores are clock-limited:** 3.0 GHz with one world and 2.1 GHz with six, against a
+    4.6 GHz turbo, at only about 71 °C. The package throttle counter was nonzero. The cause
+    isn't found yet; it needs root (`turbostat`).
+  - Each world holds its own 100 MB copy of the ocean, so its resident memory is about
+    117 MB.
 - Runs are pure functions of config, seed and feed. `verify` replays them exactly.
 - `runs/` and `oceans/` are gitignored. Results go into this file or the README as
   summaries, not raw data.
