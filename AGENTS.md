@@ -159,8 +159,20 @@ to Linux.
       new genotype. Only the gene verdict means anything there.
   - **Fix: `local=2`** (now what `--v5` sets) looks 1, 4 and 16 radii out before reaping.
     With `local=1`, seed 8's founding colony filled its patch and killed its own kin.
-  - **Rerun** as `L12_v5`, plus `L12_ns` without sex (the suspect for turnover without
-    accumulation).
+  - **Rerun** as `L12_v5` (v5 with `local=2`), plus `L12_ns` without sex (the suspect for
+    turnover without accumulation). Both 10 × 20k against `L10_h`.
+    - **v5.1: FAIL, 7/10 on genes** (one pair short of a win, sign test p = 0.17), 4/10 on
+      genotypes. No world went extinct.
+      - Second-half new significant genes ran 85–146k against the control's 3–32k, and
+        73–263× the null.
+      - The three losing pairs (seeds 1, 3 and 10) were all on growth: cumulative activity
+        fell from the second quarter to the last. Novelty was sustained in all 10.
+    - **No sex: FAIL, 0/10 on genes**, 1/10 on genotypes. 3 of 10 worlds went extinct
+      (seeds 4, 8 and 10).
+    - v5.1 beat no-sex 7/10 on genes, so sex is the piece that matters here.
+    - **Sex doesn't inflate the meter.** Crossover cuts at a random cell, so most children
+      carry a chimera gene. But the null shadow copies each birth's gene loss, so the
+      chance baseline churns just as fast, and v5.1 still clears it by 73× or more.
 - **Speed (2026-10-17):** 17–26% less CPU per run, results identical.
   `scripts/equiv.sh` compares the chains of 8 configurations between two binaries;
   every speed change must pass it.
