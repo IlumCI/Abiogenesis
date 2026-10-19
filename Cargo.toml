@@ -7,6 +7,7 @@ edition = "2024"
 bincode = "1"
 blake3 = "1"
 memchr = "2"
+memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 
 [features]

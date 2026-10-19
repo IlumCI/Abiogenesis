@@ -212,7 +212,7 @@ Cost: 30 runs × 20,000 epochs.
 - On this Linux machine a single world runs the whole 20,000 epochs in about 20 minutes,
   1,000 epochs/min at population 3,300 (measured 2026-10-16). Expect a batch in about 2
   hours.
-- `queue.sh` defaults to 3/4 of the threads (`MAX=` to change).
+- `queue.sh` defaults to half the threads at idle priority (`MAX=` to change).
 
 **Check this build matches the Windows build** (seed 1, 100 epochs, epoch-99 line of
 `chain.log`):
@@ -293,7 +293,7 @@ find out why before trusting any comparison with Windows-era results.
 ## Process
 
 - Too many simulations plus a build crashed the Windows PC. Run batches niced, at most about
-  3/4 of the threads, and don't build in the same tree while a heavy batch runs (`queue.sh`
+  half the threads (see below), and don't build in the same tree while a heavy batch runs (`queue.sh`
   freezes a copy of the binary).
 - **What limits speed here** (measured 2026-10-17, v5.1 config, MSI GF63 laptop, i7-12650H
   with 6 performance and 4 efficiency cores):
@@ -307,8 +307,19 @@ find out why before trusting any comparison with Windows-era results.
   - **The cores are clock-limited:** 3.0 GHz with one world and 2.1 GHz with six, against a
     4.6 GHz turbo, at only about 71 °C. The package throttle counter was nonzero. The cause
     isn't found yet; it needs root (`turbostat`).
-  - Each world holds its own 100 MB copy of the ocean, so its resident memory is about
-    117 MB.
+  - **Fixed 2026-10-19, results identical** (`equiv.sh` over 9 configurations at 1,000
+    epochs, the reference hashes, and a full `verify` of `L12_v5_1`):
+    - The ocean file is memory-mapped and shared, so a world's private memory fell from
+      117 MB to 14 MB.
+    - The neighbour walk (mates, prey, local birth) stepped one cell at a time over
+      cells owned outside a body. It was 30% of all instructions under v5; now it skips
+      them in runs, and `eat` stops at its first match.
+    - Bodies over 64 cells get a word-at-a-time free-space search, and the state hash
+      reuses its buffer.
+    - Net: 35% fewer instructions per epoch under v5 (callgrind, 10 crowded epochs), and
+      27% less CPU in paired runs.
+  - `queue.sh` now defaults to half the threads, and runs at idle priority
+    (`chrt --idle`).
 - Runs are pure functions of config, seed and feed. `verify` replays them exactly.
 - `runs/` and `oceans/` are gitignored. Results go into this file or the README as
   summaries, not raw data.

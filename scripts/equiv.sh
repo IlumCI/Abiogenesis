@@ -16,6 +16,7 @@ configs=(
   "reef_allops|--no-tasks --economy energy $O --all-ops --reef"
   "v4_mem2_learner|--no-tasks --economy energy $O --v4 --energy-total 8000000 --mem2 --ancestor ancestors/learner.tasm"
   "streams_debt|--no-tasks --economy energy $O --v4 --energy-total 8000000 --mem2 --streams 64 --debt"
+  "v5_mem2_hgt|--no-tasks --economy energy $O --v4 --energy-total 8000000 --mem2 --hgt --v5"
   "free_hgt_cost|--no-tasks --economy energy $O --v4 --energy-total 8000000 --mem2 --hgt --free-copy --birth-cost 10"
   "tasks_merit|$O"
   "social_capitalist|--no-tasks --economy energy $O --social --regime capitalist"

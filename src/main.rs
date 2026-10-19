@@ -181,7 +181,7 @@ fn simulate(
     links: Option<Links>,
     mut checkpoint: Option<Checkpoint>,
 ) -> Result<(Vec<[u8; 32]>, World, Meter), String> {
-    let ocean = if cfg.ocean.is_empty() || cfg.p.genome_ocean { Vec::new() } else { fs::read(&cfg.ocean).map_err(|e| format!("{}: {e}", cfg.ocean))? };
+    let ocean = if cfg.ocean.is_empty() || cfg.p.genome_ocean { world::Ocean::default() } else { world::Ocean::map(&cfg.ocean).map_err(|e| format!("{}: {e}", cfg.ocean))? };
     let resume = checkpoint.as_mut().and_then(|c| c.resume.take());
     let resumed = resume.is_some();
     let (mut w, mut m, mut feed, mut prev, e0) = match resume {
@@ -318,7 +318,7 @@ fn ocean_hash(path: &str) -> String {
     if path.is_empty() || path == "genomes" {
         return path.to_string();
     }
-    fs::read(path).map(|b| hex(blake3::hash(&b).as_bytes())).unwrap_or_default()
+    world::Ocean::map(path).map(|b| hex(blake3::hash(&b).as_bytes())).unwrap_or_default()
 }
 
 fn arg_val<'a>(args: &'a [String], key: &str) -> Option<&'a str> {

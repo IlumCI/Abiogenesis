@@ -374,6 +374,55 @@ pub enum Event {
     },
 }
 
+/// The ocean's bytes: a file mapped read-only, so worlds reading the same file share one
+/// copy in the page cache, or a buffer the world owns (the genome ocean, tests).
+pub enum Ocean {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl Default for Ocean {
+    fn default() -> Self {
+        Ocean::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for Ocean {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Ocean::Owned(v) => v,
+            Ocean::Mapped(m) => m,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Ocean {
+    fn from(v: Vec<u8>) -> Self {
+        Ocean::Owned(v)
+    }
+}
+
+impl Ocean {
+    /// Map a file. Oceans are never written while a run reads them.
+    pub fn map(path: &str) -> std::io::Result<Self> {
+        let f = std::fs::File::open(path)?;
+        // SAFETY: the mapping is read-only and the file is not modified during a run.
+        Ok(Ocean::Mapped(unsafe { memmap2::Mmap::map(&f)? }))
+    }
+
+    /// The owned buffer, replacing a mapping with an empty one.
+    fn owned(&mut self) -> &mut Vec<u8> {
+        if let Ocean::Mapped(_) = self {
+            *self = Ocean::default();
+        }
+        match self {
+            Ocean::Owned(v) => v,
+            Ocean::Mapped(_) => unreachable!(),
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct World {
     pub p: Params,
@@ -414,7 +463,7 @@ pub struct World {
     indel_hit: bool,
     /// Read-only real-world data the creatures can dive into. Empty means no ocean.
     #[serde(skip)]
-    pub ocean: Vec<u8>,
+    pub ocean: Ocean,
     /// The commons: energy not held by any creature.
     pub pool: u64,
     /// Per region: who holds the title (lord or deed holder) and the lease price per cell.
@@ -480,7 +529,8 @@ pub fn genotype_of(code: &[u8]) -> u64 {
 }
 
 impl World {
-    pub fn new(p: Params, seed: u64, ocean: Vec<u8>) -> Self {
+    pub fn new(p: Params, seed: u64, ocean: impl Into<Ocean>) -> Self {
+        let ocean: Ocean = ocean.into();
         let n = 1u32 << p.soup_bits;
         let mut rng = Rng::new(seed);
         // The soup starts as noise, not zeros, so there's leftover junk to stumble into.
@@ -594,7 +644,7 @@ impl World {
             return;
         }
         let mut hist = [0u64; 256];
-        for &b in &self.ocean {
+        for &b in self.ocean.iter() {
             hist[b as usize] += 1;
         }
         let mut ones = [0u64; 8];
@@ -647,7 +697,7 @@ impl World {
     /// own code, rebuilt every epoch from a random slot onward. Predicting it means
     /// modelling your neighbours, and it changes whenever they do.
     pub fn refresh_genome_ocean(&mut self) {
-        self.ocean.clear();
+        self.ocean.owned().clear();
         let n = self.cs.len();
         if n == 0 {
             return;
@@ -656,7 +706,7 @@ impl World {
         for k in 0..n {
             let c = &self.cs[(first + k) % n];
             if c.alive {
-                self.ocean.extend_from_slice(&self.soup[c.start as usize..(c.start + c.size) as usize]);
+                self.ocean.owned().extend_from_slice(&self.soup[c.start as usize..(c.start + c.size) as usize]);
                 if self.ocean.len() >= GENOME_OCEAN {
                     break;
                 }
@@ -664,8 +714,8 @@ impl World {
         }
     }
 
-    pub fn after_load(&mut self, ocean: Vec<u8>) {
-        self.ocean = ocean;
+    pub fn after_load(&mut self, ocean: impl Into<Ocean>) {
+        self.ocean = ocean.into();
         self.set_base_guess();
         self.build_tables();
         for i in 0..self.cs.len() {
@@ -1274,8 +1324,11 @@ impl World {
     }
 
     fn find_free_inner(&self, from: u32, size: u32, window: u32) -> Option<u32> {
-        if size == 0 || size > 64 || self.n % 64 != 0 {
+        if size == 0 || self.n % 64 != 0 {
             return self.find_free_scan(from, size, window);
+        }
+        if size > 64 {
+            return self.find_free_big(from, size, window);
         }
         // The same answer as the scan, a word at a time: the first cell, in scan order from
         // `from`, that starts `size` free cells, without crossing the end of the soup and
@@ -1311,7 +1364,47 @@ impl World {
         None
     }
 
-    /// Cell-run scan for `find_free`, used for children over 64 cells.
+    /// `find_free` for children over 64 cells: the scan's answer, one occupancy word per
+    /// step. A run that long can't fit between two owned cells of one word, so only a
+    /// word's leading free cells (finishing a run) and trailing free cells (starting one)
+    /// matter.
+    fn find_free_big(&self, from: u32, size: u32, window: u32) -> Option<u32> {
+        let (n, mut i, mut run, mut run_start) = (self.n, from, 0u32, from);
+        let limit = window.min(n) as u64 + size as u64;
+        let mut scanned = 0u64;
+        while scanned < limit {
+            if i == n {
+                i = 0;
+                run = 0;
+            }
+            let bit = i % 64;
+            let avail = (64 - bit as u64).min(limit - scanned).min((n - i) as u64) as u32;
+            let mask = if avail == 64 { !0 } else { (1u64 << avail) - 1 };
+            let w = (self.occ[(i / 64) as usize] >> bit) & mask;
+            if w == 0 {
+                if run == 0 {
+                    run_start = i;
+                }
+                if run + avail >= size {
+                    return Some(run_start);
+                }
+                run += avail;
+            } else {
+                if run + w.trailing_zeros() >= size {
+                    return Some(run_start);
+                }
+                let top = 63 - w.leading_zeros();
+                run = avail - 1 - top;
+                run_start = i + top + 1;
+            }
+            i += avail;
+            scanned += avail as u64;
+        }
+        None
+    }
+
+    /// Cell-run scan for `find_free`: the reference answer, used for soups that aren't a
+    /// whole number of words.
     fn find_free_scan(&self, from: u32, size: u32, window: u32) -> Option<u32> {
         let (n, mut i, mut run, mut run_start) = (self.n, from, 0u32, from);
         let limit = window.min(n) as u64 + size as u64;
@@ -2143,6 +2236,17 @@ impl World {
     /// in one step.
     fn neighbours(&self, centre: u32, r: u32, skip: usize) -> Vec<usize> {
         let mut out = Vec::new();
+        self.first_neighbour(centre, r, skip, |v| {
+            out.push(v);
+            false
+        });
+        out
+    }
+
+    /// The first of `neighbours`, in the same order, for which `want` says yes: the walk
+    /// stops there.
+    fn first_neighbour(&self, centre: u32, r: u32, skip: usize, mut want: impl FnMut(usize) -> bool) -> Option<usize> {
+        let mut out: Vec<usize> = Vec::new();
         let span = (2 * r as u64 + 1).min(self.n as u64) as u32;
         let (mut a, mut k) = (centre.wrapping_sub(r) & self.mask, 0u32);
         while k < span {
@@ -2150,26 +2254,39 @@ impl World {
             let step = if free & 1 == 0 {
                 if free == 0 { 64 - a % 64 } else { free.trailing_zeros() }
             } else {
-                let o = self.owner[a as usize] as usize;
-                if o == 0 {
-                    1
-                } else {
-                    let d = &self.cs[o - 1];
-                    let off = a.wrapping_sub(d.start);
-                    if d.alive && off < d.size {
-                        if o - 1 != skip && !out.contains(&(o - 1)) {
-                            out.push(o - 1);
+                let o = self.owner[a as usize];
+                let d = if o == 0 { None } else { Some(&self.cs[o as usize - 1]) };
+                match d {
+                    Some(d) if d.alive && a.wrapping_sub(d.start) < d.size => {
+                        let v = o as usize - 1;
+                        if v != skip && !out.contains(&v) {
+                            out.push(v);
+                            if want(v) {
+                                return Some(v);
+                            }
                         }
-                        d.size - off
-                    } else {
-                        1
+                        d.size - a.wrapping_sub(d.start)
+                    }
+                    _ => {
+                        // Cells with this owner outside its body (a child being written,
+                        // slack, an unowned stretch) report no one until the walk reaches
+                        // the owner's body: skip the whole run at once.
+                        // Stopping short (at the soup's end) is safe: the walk just resumes.
+                        let mut lim = (span - k).min(self.n - a);
+                        if let Some(d) = d.filter(|d| d.alive) {
+                            lim = lim.min(d.start.wrapping_sub(a) & self.mask);
+                        }
+                        let run = &self.owner[a as usize..(a + lim) as usize];
+                        let mut j = run.chunks_exact(16).take_while(|c| c.iter().all(|&x| x == o)).count() * 16;
+                        j += run[j..].iter().take_while(|&&x| x == o).count();
+                        (j as u32).max(1)
                     }
                 }
             };
             k += step;
             a = (a + step) & self.mask;
         }
-        out
+        None
     }
 
     /// v5 birth: a free spot within `radius` of the mother's target, reaping neighbours of
@@ -2225,7 +2342,7 @@ impl World {
         }
         let r = self.p.radius;
         let a = c.ax & self.mask;
-        let Some(v) = self.neighbours(a.wrapping_add(r / 2), r / 2, slot).into_iter().find(|&v| {
+        let Some(v) = self.first_neighbour(a.wrapping_add(r / 2), r / 2, slot, |v| {
             let d = &self.cs[v];
             a.wrapping_sub(d.start) & self.mask < d.size || d.start.wrapping_sub(a) & self.mask <= r / 2
         }) else {
@@ -2347,7 +2464,11 @@ impl World {
                 self.0.extend_from_slice(b);
             }
         }
-        let mut h = Buf(Vec::with_capacity(self.soup.len() + (1 << 16) + self.cs.len() * 512));
+        // The buffer is kept between calls: a fresh megabyte each epoch costs page faults.
+        thread_local!(static SPARE: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) });
+        let mut h = Buf(SPARE.take());
+        h.0.clear();
+        h.0.reserve(self.soup.len() + (1 << 16) + self.cs.len() * 512);
         h.update(&self.soup);
         h.update(&self.rng.state_bytes());
         h.update(&self.instr.to_le_bytes());
@@ -2400,7 +2521,9 @@ impl World {
                 h.update(&[c.ate as u8]);
             }
         }
-        *blake3::hash(&h.0).as_bytes()
+        let digest = *blake3::hash(&h.0).as_bytes();
+        SPARE.set(h.0);
+        digest
     }
 }
 
@@ -2478,7 +2601,7 @@ mod tests {
             }
             for _ in 0..20 {
                 let from = rng.below(w.n as u64) as u32;
-                let size = 1 + rng.below(64) as u32;
+                let size = 1 + rng.below(if round % 2 == 0 { 64 } else { 600 }) as u32;
                 let window = [0, 1, 63, 64, 100, 4096, w.n, w.n * 2][rng.below(8) as usize] + rng.below(3) as u32;
                 assert_eq!(
                     w.find_free_inner(from, size, window),
