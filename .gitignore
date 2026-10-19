@@ -3,3 +3,4 @@
 /oceans/
 # Machine-local build settings (e.g. a target-dir outside a virtualized folder).
 /.cargo/
+/target-*/
